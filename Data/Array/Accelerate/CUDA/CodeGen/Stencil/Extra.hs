@@ -60,7 +60,7 @@ stencilAccess
     -> Name                             -- seed name for temporary variables
     -> Name                             -- linear index at the focus
     -> [sh]                             -- list of offset indices
-    -> Boundary (CUExp aenv e)          -- stencil boundary condition
+    -> Boundary (CUExp () aenv e)       -- stencil boundary condition
     -> Eliminate e                      -- dead code elimination flags
     -> ( [C.Definition]                 -- kernel texture reference definitions
        , [C.Param]                      -- kernel function arguments
@@ -248,7 +248,7 @@ readStencil dev grp dummy
           | computeCapability dev < Compute 2 0 = arrayAsTex dummy grp
           | otherwise                           = ([], arrayAsArg dummy grp)
 
-        dim             = expDim (undefined :: Exp aenv sh)
+        dim             = expDim (undefined :: Exp () aenv sh)
         sh'             = cshape dim sh
         fetch ix        = zipWith (\t a -> indexArray dev t (cvar a) (rvalue ix)) (eltType (undefined :: e)) arrs
     in

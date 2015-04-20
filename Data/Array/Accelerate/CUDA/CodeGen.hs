@@ -1,9 +1,11 @@
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE PatternGuards       #-}
 {-# LANGUAGE QuasiQuotes         #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE TypeOperators       #-}
 {-# LANGUAGE ViewPatterns        #-}
 {-# OPTIONS -fno-warn-name-shadowing #-}
 -- |
@@ -19,9 +21,14 @@
 
 module Data.Array.Accelerate.CUDA.CodeGen (
 
-  CUTranslSkel, codegenAcc, codegenToSeq
+  CUTranslSkel, codegenAcc, codegenToSeq, codegenFoldSeq, codegenScanSeq,
+
+  codegenAccLifted,
 
 ) where
+
+-- new TODO cleanup
+import Data.Monoid ( mempty )
 
 -- libraries
 import Prelude                                                  hiding ( id, exp, replicate )
@@ -41,7 +48,8 @@ import Data.Array.Accelerate.Trafo
 import Data.Array.Accelerate.Pretty                             ()
 import Data.Array.Accelerate.Analysis.Shape
 import Data.Array.Accelerate.Array.Sugar                        ( Array, Shape, Elt, EltRepr
-                                                                , Tuple(..), TupleRepr )
+                                                                , Tuple(..), TupleRepr, (:.)
+                                                                , Vector, Scalar, Z )
 import Data.Array.Accelerate.Array.Representation               ( SliceIndex(..) )
 import qualified Data.Array.Accelerate.Array.Sugar              as Sugar
 import qualified Data.Array.Accelerate.Analysis.Type            as Sugar
@@ -88,84 +96,234 @@ prj _            _            = $internalError "prj" "inconsistent valuation"
 --
 -- TODO: include a measure of how much shared memory a kernel requires.
 --
-codegenAcc :: forall aenv arrs. DeviceProperties -> DelayedOpenAcc aenv arrs -> Gamma aenv -> [ CUTranslSkel aenv arrs ]
-codegenAcc _   Delayed{}       _    = $internalError "codegenAcc" "expected manifest array"
-codegenAcc dev (Manifest pacc) aenv
-  = codegen
-  $ case pacc of
 
+seqShape :: (Shape sh, Elt e) => Gamma senv -> Idx senv (Array sh e) -> [C.Exp]
+seqShape senv idx = [cexp| chunksz |] : cshape (reifyDim idx) (fst (namesOfSvar senv idx))
+
+codegenSeq :: forall sh e senv aenv. (Shape sh, Elt e) => DeviceProperties -> Gamma aenv -> Gamma senv -> Idx senv (Array sh e) -> CUDA (CUDelayedAcc senv aenv (sh :. Int) e)
+codegenSeq _ _ senv (idx :: Idx senv (Array sh e)) = return $
+  CUDelayed (CUExp ([], sh))
+            (CUFun1 elim inst)
+            (CUFun1 elim instL)
+  where
+    (shname, arrs) = namesOfSvar senv idx
+
+    sh :: [C.Exp]
+    sh = seqShape senv idx
+    elim   = zip (repeat True)
+    get ix = ([], map (\a -> [cexp| $id:a [ $exp:ix ] |]) arrs)
+    inst  :: Instantiate1 (sh :. Int) e
+    inst  ix  = get (ctoIndex sh ix) -- TODO let-bind to avoid code-duplication.
+    instL :: Instantiate1 Int e
+    instL [i] = get (rvalue i)
+    instL _ = $internalError "codegenSeq" $ "instL"
+
+codegenDelayedAcc :: forall aenv sh e. (Shape sh, Elt e) => DeviceProperties -> Gamma aenv -> DelayedOpenAcc aenv (Array sh e) -> CUDA (CUDelayedAcc () aenv sh e)
+codegenDelayedAcc dev aenv = travD
+  where
+    travD :: DelayedOpenAcc aenv (Array sh e) -> CUDA (CUDelayedAcc () aenv sh e)
+    travD Manifest{}  = $internalError "codegenAcc" "expected delayed array"
+    travD Delayed{..} = CUDelayed <$> travE extentD
+                                  <*> travF1 indexD
+                                  <*> travF1 linearIndexD
+
+    travF1 :: DelayedFun () aenv (a -> b) -> CUDA (CUFun1 () aenv (a -> b))
+    travF1 = codegenFun1 dev aenv mempty (error "#1")
+
+    travE :: DelayedExp () aenv t -> CUDA (CUExp () aenv t)
+    travE = codegenExp dev aenv mempty (error "#2")
+
+-- Given a function from shape 'sh' to some type, provide a funtion
+-- from the shape of a on chunk 'sh :. Int' that simply ignores the
+-- streaming dimension.
+liftedShapeFun :: CUFun1 senv aenv (sh'          -> e)
+               -> CUFun1 senv aenv ((sh' :. Int) -> e)
+liftedShapeFun (CUFun1 used fun) =
+  CUFun1 (\ xs -> (False, head xs) : used (tail xs))
+         (\ xs -> fun (tail xs))
+
+-- Given a permutation (sh -> sh'), provide a permutation on chunks
+-- (sh :. Int -> sh' :. Int) that is the identity in the streaming
+-- dimension.
+liftedPermute :: CUFun1 senv aenv (sh'        -> sh       )
+                 -> CUFun1 senv aenv (sh' :. Int -> sh :. Int)
+liftedPermute (CUFun1 used fun) =
+  CUFun1 (\ xs -> (True, head xs) : used (tail xs))
+         (\ xs -> let (blocks, exps) = fun (tail xs) in (blocks, rvalue (head xs) : exps))
+
+replicateCUFun :: (Shape sh, Shape sl) => SliceIndex slix (EltRepr sl) co (EltRepr sh)
+               -> CUFun1 senv aenv (sh -> sl)
+replicateCUFun slix =
+  CUFun1 (zip (reverse (used slix)))
+         (\ xs -> ([], reverse $ restrict slix (reverse (map rvalue xs))))
+  where
+    used :: SliceIndex a b c d -> [Bool]
+    used SliceNil = []
+    used (SliceFixed sl) = False : used sl
+    used (SliceAll   sl) = True  : used sl
+
+    restrict :: SliceIndex a b c d -> [e]{-sh-} -> [e]{-sl-}
+    restrict SliceNil        []     = []
+    restrict (SliceFixed sl) (_:ys) =     restrict sl ys
+    restrict (SliceAll   sl) (y:ys) = y : restrict sl ys
+    restrict _ _ = error "replicateCUFun"
+
+sliceCUFun :: (Shape sh, Shape sl, Elt slix) => SliceIndex (EltRepr slix) (EltRepr sl) co (EltRepr sh)
+           -> CUExp () aenv slix -> CUFun1 senv aenv (sl -> sh)
+sliceCUFun slix (CUExp (blocks, exps)) =
+  CUFun1 (zip (repeat True))
+         (\ xs -> (blocks, reverse $ combine slix (reverse (map rvalue xs)) (reverse exps)))
+  where
+    combine :: SliceIndex a b c d -> [e]{-slix-} -> [e]{-sl-} -> [e]{-sh-}
+    combine SliceNil [] [] = []
+    combine (SliceFixed sl) xs (y:ys) = y : combine sl xs ys
+    combine (SliceAll   sl) (x:xs) ys = x : combine sl xs ys
+    combine _ _ _ = error "sliceCUFun"
+
+flattenCU :: CUDelayedAcc senv aenv (sh :. Int :. Int) e
+          -> CUDelayedAcc senv aenv (sh :. Int) e
+flattenCU (CUDelayed (CUExp (shB, sh)) _ c)
+  = CUDelayed  (CUExp (shB, sh' ++ [[cexp| $exp:n * $exp:k |]] )) ($internalError "flattenCU" "linear indexing only") c
+  where
+    n = head sh
+    k = last sh
+    sh' = init (tail sh)
+
+codegenAccLifted :: forall senv aenv sh e.
+                    DeviceProperties
+                 -> PreOpenArrayOp (Idx senv) DelayedOpenAcc senv aenv (Array sh e)
+                 -> Gamma aenv
+                 -> Gamma senv
+                 -> [ CUTranslSkel senv aenv (Chunk sh e) ]
+codegenAccLifted dev op aenv senv
+  = codegen
+  $ case op of
       -- Producers
-      Map f a                   -> mkMap dev aenv       <$> travF1 f <*> travD a
-      Generate _ f              -> mkGenerate dev aenv  <$> travF1 f
-      Transform _ p f a         -> mkTransform dev aenv <$> travF1 p <*> travF1 f  <*> travD a
-      Backpermute _ p a         -> mkTransform dev aenv <$> travF1 p <*> travF1 id <*> travD a
+      Map f x                   -> mkMap dev aenv senv <$> travF1streaming (reifyDim x) f <*> travD x
+
+      Generate sh f             -> mkGenerate dev aenv senv  <$> (liftedShapeFun <$> travF1streaming (expDim sh) f)
+      Transform sh p f x        -> mkTransform dev aenv senv <$> (liftedPermute <$> travF1streaming (expDim sh) p)
+                                                             <*> travF1streaming (expDim sh) f
+                                                             <*> travD x
+      Backpermute sh p x        -> mkTransform dev aenv senv <$> (liftedPermute <$> travF1streaming (expDim sh) p) <*> travF1streaming (expDim sh) id <*> travD x
+      -- Consumers
+      Fold f z a                -> mkFold  dev aenv senv  <$> travF2 f <*> travE z  <*> travD a
+      Fold1 f a                 -> mkFold1 dev aenv senv  <$> travF2 f <*> travD a
+      FoldSeg f z a s           -> map cast <$> (mkFoldSeg dev aenv senv <$> travF2 f <*> travE z  <*> (flattenCU <$> travD a) <*> (flattenCU <$> travD s))
+      Fold1Seg f a s            -> map cast <$> (mkFold1Seg dev aenv senv <$> travF2 f <*> (flattenCU <$> travD a)  <*> (flattenCU <$> travD s))
+--      Scanl f z a               -> mkScanl dev aenv     <$> travF2 f <*> travE z  <*> travD a
+--      Scanr f z a               -> mkScanr dev aenv     <$> travF2 f <*> travE z  <*> travD a
+--      Scanl' f z a              -> mkScanl' dev aenv    <$> travF2 f <*> travE z  <*> travD a
+--      Scanr' f z a              -> mkScanr' dev aenv    <$> travF2 f <*> travE z  <*> travD a
+--      Scanl1 f a                -> mkScanl1 dev aenv    <$> travF2 f <*> travD a
+--      Scanr1 f a                -> mkScanr1 dev aenv    <$> travF2 f <*> travD a
+      Permute f d p a           -> mkPermute dev aenv senv  <$> travF2 f <*> (liftedPermute <$> travF1streaming (reifyDim d) p) <*> travD a
+--      Stencil f b a             -> mkStencil dev aenv   <$> travF1 f <*> travB a b
+--      Stencil2 f b1 a1 b2 a2    -> mkStencil2 dev aenv  <$> travF2 f <*> travB a1 b1 <*> travB a2 b2
+      Replicate slix _ a        -> mkTransform dev aenv senv (liftedPermute (replicateCUFun slix)) <$> travF1streaming 0 id <*> travD a
+      Slice slix a slice        -> mkTransform dev aenv senv <$> (liftedPermute <$> (sliceCUFun slix <$> travE slice)) <*> travF1streaming 0 id <*> travD a
+      ZipWith{}                 -> fusionError
+
+  where
+    eltSz :: Name -> Int -> C.Exp
+    eltSz name n = csize (cshape n name)
+
+    cast :: CUTranslSkel senv aenv a -> CUTranslSkel senv aenv b
+    cast (CUTranslSkel entry code) = CUTranslSkel entry code
+
+    id :: Elt a => DelayedFun senv aenv (a -> a)
+    id = Lam (Body (Var ZeroIdx))
+
+    travF1streaming :: Int -> DelayedFun senv aenv (a -> b) -> CUDA (CUFun1 senv aenv (a -> b))
+    travF1streaming n = codegenFun1 dev aenv senv (eltSz "Out" n)
+
+    travD :: (Shape sh', Elt e') => Idx senv (Array sh' e') -> CUDA (CUDelayedAcc senv aenv (sh' :. Int) e')
+    travD = codegenSeq dev aenv senv
+{-
+    travF1 :: DelayedFun () aenv (a -> b) -> CUDA (CUFun1 () aenv (a -> b))
+    travF1 = codegenFun1 dev aenv mempty undefined
+-}
+    travF2 :: DelayedFun () aenv (a -> b -> c) -> CUDA (CUFun2 () aenv (a -> b -> c))
+    travF2 = codegenFun2 dev aenv mempty (error "#3")
+
+    travE :: DelayedExp () aenv t -> CUDA (CUExp () aenv t)
+    travE = codegenExp dev aenv mempty (error "#4")
+{-
+    travB :: forall sh e. Elt e
+          => Idx senv (Array sh e) -> Boundary (EltRepr e) -> CUDA (Boundary (CUExp () aenv e))
+    travB _ Clamp        = return Clamp
+    travB _ Mirror       = return Mirror
+    travB _ Wrap         = return Wrap
+    travB _ (Constant c) = return . Constant $ CUExp ([], constant (Sugar.eltType (undefined::e)) c)
+-}
+    -- caffeine and misery
+    prim :: String
+    prim                = showPreArrOp op
+    fusionError         = $internalError "codegenAcc" $ "unexpected fusible material: " ++ prim
+
+codegen :: CUDA [CUTranslSkel senv aenv a] -> [CUTranslSkel senv aenv a]
+codegen cuda =
+  let (skeletons, st)                = runCUDA cuda
+      addTo (CUTranslSkel name code) =
+        CUTranslSkel name (Set.foldr (\h c -> [cedecl| $esc:("#include \"" ++ h ++ "\"") |] : c) code (headers st))
+  in
+  map addTo skeletons
+
+codegenAcc :: forall aenv arrs.
+              DeviceProperties
+           -> PreOpenArrayOp (DelayedOpenAcc aenv) DelayedOpenAcc () aenv arrs
+           -> Gamma aenv
+           -> [ CUTranslSkel () aenv arrs ]
+codegenAcc dev op aenv
+  = codegen
+  $ case op of
+      -- Producers
+      Map f a                   -> mkMap dev aenv senv       <$> travF1 f <*> travD a
+      Generate _ f              -> mkGenerate dev aenv senv  <$> travF1 f
+      Transform _ p f a         -> mkTransform dev aenv senv <$> travF1 p <*> travF1 f  <*> travD a
+      Backpermute _ p a         -> mkTransform dev aenv senv <$> travF1 p <*> travF1 id <*> travD a
 
       -- Consumers
-      Fold f z a                -> mkFold  dev aenv     <$> travF2 f <*> travE z  <*> travD a
-      Fold1 f a                 -> mkFold1 dev aenv     <$> travF2 f <*> travD a
-      FoldSeg f z a s           -> mkFoldSeg dev aenv   <$> travF2 f <*> travE z  <*> travD a <*> travD s
-      Fold1Seg f a s            -> mkFold1Seg dev aenv  <$> travF2 f <*> travD a  <*> travD s
+      Fold f z a                -> mkFold  dev aenv senv     <$> travF2 f <*> travE z  <*> travD a
+      Fold1 f a                 -> mkFold1 dev aenv senv     <$> travF2 f <*> travD a
+      FoldSeg f z a s           -> mkFoldSeg dev aenv senv   <$> travF2 f <*> travE z  <*> travD a <*> travD s
+      Fold1Seg f a s            -> mkFold1Seg dev aenv senv  <$> travF2 f <*> travD a  <*> travD s
       Scanl f z a               -> mkScanl dev aenv     <$> travF2 f <*> travE z  <*> travD a
       Scanr f z a               -> mkScanr dev aenv     <$> travF2 f <*> travE z  <*> travD a
       Scanl' f z a              -> mkScanl' dev aenv    <$> travF2 f <*> travE z  <*> travD a
       Scanr' f z a              -> mkScanr' dev aenv    <$> travF2 f <*> travE z  <*> travD a
       Scanl1 f a                -> mkScanl1 dev aenv    <$> travF2 f <*> travD a
       Scanr1 f a                -> mkScanr1 dev aenv    <$> travF2 f <*> travD a
-      Permute f _ p a           -> mkPermute dev aenv   <$> travF2 f <*> travF1 p <*> travD a
+      Permute f _ p a           -> mkPermute dev aenv senv  <$> travF2 f <*> travF1 p <*> travD a
       Stencil f b a             -> mkStencil dev aenv   <$> travF1 f <*> travB a b
       Stencil2 f b1 a1 b2 a2    -> mkStencil2 dev aenv  <$> travF2 f <*> travB a1 b1 <*> travB a2 b2
-
-      -- Sequence collection
-      Collect _                 -> unexpectedError
-
-      -- Non-computation forms -> sadness
-      Alet{}                    -> unexpectedError
-      Avar{}                    -> unexpectedError
-      Apply{}                   -> unexpectedError
-      Acond{}                   -> unexpectedError
-      Awhile{}                  -> unexpectedError
-      Atuple{}                  -> unexpectedError
-      Aprj{}                    -> unexpectedError
-      Use{}                     -> unexpectedError
-      Unit{}                    -> unexpectedError
-      Aforeign{}                -> unexpectedError
-      Reshape{}                 -> unexpectedError
-
       Replicate{}               -> fusionError
       Slice{}                   -> fusionError
       ZipWith{}                 -> fusionError
 
   where
-    codegen :: CUDA [CUTranslSkel aenv a] -> [CUTranslSkel aenv a]
-    codegen cuda =
-      let (skeletons, st)                = runCUDA cuda
-          addTo (CUTranslSkel name code) =
-            CUTranslSkel name (Set.foldr (\h c -> [cedecl| $esc:("#include \"" ++ h ++ "\"") |] : c) code (headers st))
-      in
-      map addTo skeletons
+    senv :: Gamma ()
+    senv = mempty
 
-    id :: Elt a => DelayedFun aenv (a -> a)
+    id :: Elt a => DelayedFun () aenv (a -> a)
     id = Lam (Body (Var ZeroIdx))
 
     -- code generation for delayed arrays
-    travD :: (Shape sh, Elt e) => DelayedOpenAcc aenv (Array sh e) -> CUDA (CUDelayedAcc aenv sh e)
-    travD Manifest{}  = $internalError "codegenAcc" "expected delayed array"
-    travD Delayed{..} = CUDelayed <$> travE extentD
-                                  <*> travF1 indexD
-                                  <*> travF1 linearIndexD
+    travD :: (Shape sh, Elt e) => DelayedOpenAcc aenv (Array sh e) -> CUDA (CUDelayedAcc () aenv sh e)
+    travD = codegenDelayedAcc dev aenv
 
     -- scalar code generation
-    travF1 :: DelayedFun aenv (a -> b) -> CUDA (CUFun1 aenv (a -> b))
-    travF1 = codegenFun1 dev aenv
+    travF1 :: DelayedFun () aenv (a -> b) -> CUDA (CUFun1 () aenv (a -> b))
+    travF1 = codegenFun1 dev aenv senv (error "#5")
 
-    travF2 :: DelayedFun aenv (a -> b -> c) -> CUDA (CUFun2 aenv (a -> b -> c))
-    travF2 = codegenFun2 dev aenv
+    travF2 :: DelayedFun () aenv (a -> b -> c) -> CUDA (CUFun2 () aenv (a -> b -> c))
+    travF2 = codegenFun2 dev aenv senv (error "#6")
 
-    travE :: DelayedExp aenv t -> CUDA (CUExp aenv t)
-    travE = codegenExp dev aenv
+    travE :: DelayedExp () aenv t -> CUDA (CUExp () aenv t)
+    travE = codegenExp dev aenv senv (error "#7")
 
     travB :: forall sh e. Elt e
-          => DelayedOpenAcc aenv (Array sh e) -> Boundary (EltRepr e) -> CUDA (Boundary (CUExp aenv e))
+          => DelayedOpenAcc aenv (Array sh e) -> Boundary (EltRepr e) -> CUDA (Boundary (CUExp () aenv e))
     travB _ Clamp        = return Clamp
     travB _ Mirror       = return Mirror
     travB _ Wrap         = return Wrap
@@ -173,11 +331,38 @@ codegenAcc dev (Manifest pacc) aenv
 
     -- caffeine and misery
     prim :: String
-    prim                = showPreAccOp pacc
-    unexpectedError     = $internalError "codegenAcc" $ "unexpected array primitive: " ++ prim
+    prim                = showPreArrOp op
     fusionError         = $internalError "codegenAcc" $ "unexpected fusible material: " ++ prim
 
-codegenToSeq :: forall aenv slix sl co sh e. (Shape sl, Shape sh, Elt e)
+
+codegenFoldSeq :: forall aenv e. Elt e
+               => DeviceProperties
+               -> Gamma aenv
+               -> DelayedFun () aenv (e -> e -> e)
+               -> CUTranslSkel () aenv (Chunk Z e)
+codegenFoldSeq dev aenv f =
+    head
+  $ codegen
+  $ return
+  <$> (mkInplaceUpdate dev aenv <$> codegenFun2 dev aenv mempty (error "#9") f)
+
+codegenScanSeq :: forall senv aenv e. Elt e
+               => DeviceProperties
+               -> Gamma aenv
+               -> DelayedFun () aenv (e -> e -> e)
+               -> Idx senv (Scalar e)
+               -> [CUTranslSkel senv aenv (Chunk Z e)]
+codegenScanSeq dev aenv f x =
+    codegen
+  $ mkScanl dev aenv <$> codegenFun2 dev aenv mempty (error "#10") f <*> return z <*> codegenSeq dev aenv mempty x
+  where
+    (_, _, sum) = readArray "Sum" (undefined :: Vector e)
+    z :: CUExp () aenv e
+    z | CUDelayed _ _ (CUFun1 _ get) <- sum 
+      = let (_, sh, _) = locals "sh" (undefined :: Z :. Int) 
+        in CUExp (get sh)
+
+codegenToSeq :: forall aenv senv slix sl co sh e. (Shape sl, Shape sh, Elt e)
                 => SliceIndex slix
                               (EltRepr sl)
                               co
@@ -185,30 +370,16 @@ codegenToSeq :: forall aenv slix sl co sh e. (Shape sl, Shape sh, Elt e)
                 -> DeviceProperties
                 -> DelayedOpenAcc aenv (Array sh e)
                 -> Gamma aenv
-                -> CUTranslSkel aenv (Array sl e)
-codegenToSeq slix dev acc aenv = codegen $ (mkToSeq slix dev aenv <$> travD acc)
-  where
-    codegen :: CUDA (CUTranslSkel aenv (Array sl e)) -> CUTranslSkel aenv (Array sl e)
-    codegen cuda =
-      let (skeleton, st)                 = runCUDA cuda
-          addTo (CUTranslSkel name code) =
-            CUTranslSkel name (Set.foldr (\h c -> [cedecl| $esc:("#include \"" ++ h ++ "\"") |] : c) code (headers st))
-      in
-      addTo skeleton
+                -> CUTranslSkel senv aenv (Chunk sl e)
+codegenToSeq slix dev acc aenv = 
+  head $ codegen $ return <$> (mkToSeq slix dev aenv <$> codegenDelayedAcc dev aenv acc)
+{-
+    travE :: forall t. DelayedExp () aenv t -> CUDA (CUExp () aenv t)
+    travE = codegenExp dev aenv mempty undefined
 
-    -- code generation for delayed arrays
-    travD :: (Shape sh, Elt e) => DelayedOpenAcc aenv (Array sh e) -> CUDA (CUDelayedAcc aenv sh e )
-    travD Manifest{}  = $internalError "codegenAcc" "expected delayed array"
-    travD Delayed{..} = CUDelayed <$> travE extentD
-                                  <*> travF1 indexD
-                                  <*> travF1 linearIndexD
-
-    travE :: forall t. DelayedExp aenv t -> CUDA (CUExp aenv t)
-    travE = codegenExp dev aenv
-
-    travF1 :: forall a b. DelayedFun aenv (a -> b) -> CUDA (CUFun1 aenv (a -> b))
-    travF1 = codegenFun1 dev aenv
-
+    travF1 :: forall a b. DelayedFun () aenv (a -> b) -> CUDA (CUFun1 () aenv (a -> b))
+    travF1 = codegenFun1 dev aenv mempty undefined
+-}
 
 -- Scalar function abstraction
 -- ---------------------------
@@ -228,16 +399,18 @@ codegenToSeq slix dev acc aenv = codegen $ (mkToSeq slix dev aenv <$> travD acc)
 -- skeleton.
 --
 codegenFun1
-    :: forall aenv a b. DeviceProperties
+    :: forall aenv senv a b. DeviceProperties
     -> Gamma aenv
-    -> DelayedFun aenv (a -> b)
-    -> CUDA (CUFun1 aenv (a -> b))
-codegenFun1 dev aenv fun
+    -> Gamma senv
+    -> C.Exp -- Stream index
+    -> DelayedFun senv aenv (a -> b)
+    -> CUDA (CUFun1 senv aenv (a -> b))
+codegenFun1 dev aenv senv k fun
   | Lam (Body f) <- fun
   = let
         go :: Rvalue x => [x] -> Gen ([C.BlockItem], [C.Exp])
         go x = do
-          code  <- mapM use =<< codegenOpenExp dev aenv f (Empty `Push` map rvalue x)
+          code  <- mapM use =<< codegenOpenExp dev aenv senv k f (Empty `Push` map rvalue x)
           env'  <- getEnv
           return (env', code)
 
@@ -255,16 +428,18 @@ codegenFun1 dev aenv fun
 
 
 codegenFun2
-    :: forall aenv a b c. DeviceProperties
+    :: forall aenv senv a b c. DeviceProperties
     -> Gamma aenv
-    -> DelayedFun aenv (a -> b -> c)
-    -> CUDA (CUFun2 aenv (a -> b -> c))
-codegenFun2 dev aenv fun
+    -> Gamma senv
+    -> C.Exp -- Stream index
+    -> DelayedFun senv aenv (a -> b -> c)
+    -> CUDA (CUFun2 senv aenv (a -> b -> c))
+codegenFun2 dev aenv senv k fun
   | Lam (Lam (Body f)) <- fun
   = let
         go :: (Rvalue x, Rvalue y) => [x] -> [y] -> Gen ([C.BlockItem], [C.Exp])
         go x y = do
-          code  <- mapM use =<< codegenOpenExp dev aenv f (Empty `Push` map rvalue x `Push` map rvalue y)
+          code  <- mapM use =<< codegenOpenExp dev aenv senv k f (Empty `Push` map rvalue x `Push` map rvalue y)
           env'  <- getEnv
           return (env', code)
 
@@ -324,10 +499,10 @@ visit exp
 
 -- Generation of scalar expressions
 --
-codegenExp :: DeviceProperties -> Gamma aenv -> DelayedExp aenv t -> CUDA (CUExp aenv t)
-codegenExp dev aenv exp =
+codegenExp :: DeviceProperties -> Gamma aenv -> Gamma senv -> C.Exp -> DelayedExp senv aenv t -> CUDA (CUExp senv aenv t)
+codegenExp dev aenv senv k exp =
   evalCGM $ do
-    code        <- codegenOpenExp dev aenv exp Empty
+    code        <- codegenOpenExp dev aenv senv k exp Empty
     env         <- getEnv
     return      $! CUExp (env,code)
 
@@ -336,17 +511,19 @@ codegenExp dev aenv exp =
 -- fragments. This is tricky to get right!
 --
 codegenOpenExp
-    :: forall aenv env' t'. DeviceProperties
+    :: forall aenv senv env' t'. DeviceProperties
     -> Gamma aenv
-    -> DelayedOpenExp env' aenv t'
+    -> Gamma senv
+    -> C.Exp -- Stream index
+    -> DelayedOpenExp env' senv aenv t'
     -> Val env'
     -> Gen [C.Exp]
-codegenOpenExp dev aenv = cvtE
+codegenOpenExp dev aenv senv k = cvtE
   where
     -- Generate code for a scalar expression in depth-first order. We run under
     -- a monad that generates fresh names and keeps track of let bindings.
     --
-    cvtE :: forall env t. DelayedOpenExp env aenv t -> Val env -> Gen [C.Exp]
+    cvtE :: forall env t. DelayedOpenExp env senv aenv t -> Val env -> Gen [C.Exp]
     cvtE exp env = visit =<<
       case exp of
         Let bnd body            -> elet bnd body env
@@ -378,6 +555,11 @@ codegenOpenExp dev aenv = cvtE
         Intersect sh1 sh2       -> intersect sh1 sh2 env
         Union sh1 sh2           -> union sh1 sh2 env
 
+        -- Sequence operations
+        IndexS x ix             -> indexS x ix env
+        LinearIndexS x ix       -> linearIndexS x ix env
+        ShapeS x                -> shapeS x env
+
         --Foreign function
         Foreign ff _ e          -> foreignE ff e env
 
@@ -393,7 +575,7 @@ codegenOpenExp dev aenv = cvtE
     -- something is added, it remains in scope forever. We are relying on
     -- liveness analysis of the CUDA compiler to manage register pressure.
     --
-    elet :: DelayedOpenExp env aenv bnd -> DelayedOpenExp (env, bnd) aenv body -> Val env -> Gen [C.Exp]
+    elet :: DelayedOpenExp env senv aenv bnd -> DelayedOpenExp (env, bnd) senv aenv body -> Val env -> Gen [C.Exp]
     elet bnd body env = do
       bnd'      <- cvtE bnd env >>= pushEnv bnd
       body'     <- cvtE body (env `Push` bnd')
@@ -403,7 +585,7 @@ codegenOpenExp dev aenv = cvtE
     -- operation as a statement expression. This is necessary to ensure proper
     -- short-circuit behaviour for logical operations.
     --
-    primApp :: PrimFun (a -> b) -> DelayedOpenExp env aenv a -> Val env -> Gen [C.Exp]
+    primApp :: PrimFun (a -> b) -> DelayedOpenExp env senv aenv a -> Val env -> Gen [C.Exp]
     primApp f x env =
       case f of
         -- operators from Num
@@ -472,7 +654,7 @@ codegenOpenExp dev aenv = cvtE
         PrimBoolToInt           -> unary A.boolToInt x env
         PrimFromIntegral ta tb  -> unary (A.fromIntegral ta tb) x env
       where
-        cvtE' :: DelayedOpenExp env aenv a -> Val env -> Gen C.Exp
+        cvtE' :: DelayedOpenExp env senv aenv a -> Val env -> Gen C.Exp
         cvtE' e env = do
           (b,r) <- clean $ single "primApp" <$> cvtE e env
           if null b
@@ -482,19 +664,19 @@ codegenOpenExp dev aenv = cvtE
         -- TLM: This is a bit ugly. Consider making all primitive functions from
         --      Arithmetic.hs evaluate in the Gen monad.
         --
-        unary :: (C.Exp -> C.Exp) -> DelayedOpenExp env aenv a -> Val env -> Gen [C.Exp]
+        unary :: (C.Exp -> C.Exp) -> DelayedOpenExp env senv aenv a -> Val env -> Gen [C.Exp]
         unary f = unaryM  (return . f)
 
-        unaryM :: (C.Exp -> Gen C.Exp) -> DelayedOpenExp env aenv a -> Val env -> Gen [C.Exp]
+        unaryM :: (C.Exp -> Gen C.Exp) -> DelayedOpenExp env senv aenv a -> Val env -> Gen [C.Exp]
         unaryM f a env = do
           a' <- cvtE' a env
           r  <- f a'
           return [r]
 
-        binary :: (C.Exp -> C.Exp -> C.Exp) -> DelayedOpenExp env aenv (a,b) -> Val env -> Gen [C.Exp]
+        binary :: (C.Exp -> C.Exp -> C.Exp) -> DelayedOpenExp env senv aenv (a,b) -> Val env -> Gen [C.Exp]
         binary f = binaryM (\a b -> return (f a b))
 
-        binaryM :: (C.Exp -> C.Exp -> Gen C.Exp) -> DelayedOpenExp env aenv (a,b) -> Val env -> Gen [C.Exp]
+        binaryM :: (C.Exp -> C.Exp -> Gen C.Exp) -> DelayedOpenExp env senv aenv (a,b) -> Val env -> Gen [C.Exp]
         binaryM f (Tuple (NilTup `SnocTup` a `SnocTup` b)) env = do
           a' <- cvtE' a env
           b' <- cvtE' b env
@@ -502,7 +684,7 @@ codegenOpenExp dev aenv = cvtE
           return [r]
         binaryM _ _ _ = $internalError "primApp" "unexpected argument to binary function"
 
-        binaryM2 :: (C.Exp -> C.Exp -> Gen (C.Exp, C.Exp)) -> DelayedOpenExp env aenv (a,b) -> Val env -> Gen [C.Exp]
+        binaryM2 :: (C.Exp -> C.Exp -> Gen (C.Exp, C.Exp)) -> DelayedOpenExp env senv aenv (a,b) -> Val env -> Gen [C.Exp]
         binaryM2 f (Tuple (NilTup `SnocTup` a `SnocTup` b)) env = do
           a'    <- cvtE' a env
           b'    <- cvtE' b env
@@ -514,7 +696,7 @@ codegenOpenExp dev aenv = cvtE
     -- snoc-list ordering, so the element at tuple index zero is at the end of
     -- the list. Note that nested tuple structures are flattened.
     --
-    cvtT :: Tuple (DelayedOpenExp env aenv) t -> Val env -> Gen [C.Exp]
+    cvtT :: Tuple (DelayedOpenExp env senv aenv) t -> Val env -> Gen [C.Exp]
     cvtT tup env =
       case tup of
         NilTup          -> return []
@@ -525,8 +707,8 @@ codegenOpenExp dev aenv = cvtE
     -- expressions, rather than picking out a single element.
     --
     prjT :: forall env t e. TupleIdx (TupleRepr t) e
-         -> DelayedOpenExp env aenv t
-         -> DelayedOpenExp env aenv e
+         -> DelayedOpenExp env senv aenv t
+         -> DelayedOpenExp env senv aenv e
          -> Val env
          -> Gen [C.Exp]
     prjT ix t e env =
@@ -557,9 +739,9 @@ codegenOpenExp dev aenv = cvtE
     -- evaluated before the correct result is chosen.
     --
     cond :: forall env t. Elt t
-         => DelayedOpenExp env aenv Bool
-         -> DelayedOpenExp env aenv t
-         -> DelayedOpenExp env aenv t
+         => DelayedOpenExp env senv aenv Bool
+         -> DelayedOpenExp env senv aenv t
+         -> DelayedOpenExp env senv aenv t
          -> Val env
          -> Gen [C.Exp]
     cond p t f env = do
@@ -587,9 +769,9 @@ codegenOpenExp dev aenv = cvtE
     -- Value recursion
     --
     while :: forall env a. Elt a
-          => DelayedOpenFun env aenv (a -> Bool)        -- continue while predicate returns true
-          -> DelayedOpenFun env aenv (a -> a)           -- loop body
-          -> DelayedOpenExp env aenv a                  -- initial value
+          => DelayedOpenFun env senv aenv (a -> Bool)        -- continue while predicate returns true
+          -> DelayedOpenFun env senv aenv (a -> a)           -- loop body
+          -> DelayedOpenExp env senv aenv a                  -- initial value
           -> Val env
           -> Gen [C.Exp]
     while test step x env
@@ -646,8 +828,8 @@ codegenOpenExp dev aenv = cvtE
     -- represented in by any C term (Any ~ [])
     --
     indexSlice :: SliceIndex (EltRepr slix) sl co (EltRepr sh)
-               -> DelayedOpenExp env aenv slix
-               -> DelayedOpenExp env aenv sh
+               -> DelayedOpenExp env senv aenv slix
+               -> DelayedOpenExp env senv aenv sh
                -> Val env
                -> Gen [C.Exp]
     indexSlice sliceIndex slix sh env =
@@ -665,8 +847,8 @@ codegenOpenExp dev aenv = cvtE
     -- elide the presence of Any from the head of slx.
     --
     indexFull :: SliceIndex (EltRepr slix) (EltRepr sl) co sh
-              -> DelayedOpenExp env aenv slix
-              -> DelayedOpenExp env aenv sl
+              -> DelayedOpenExp env senv aenv slix
+              -> DelayedOpenExp env senv aenv sl
               -> Val env
               -> Gen [C.Exp]
     indexFull sliceIndex slix sl env =
@@ -682,13 +864,13 @@ codegenOpenExp dev aenv = cvtE
 
     -- Convert between linear and multidimensional indices
     --
-    toIndex :: DelayedOpenExp env aenv sh -> DelayedOpenExp env aenv sh -> Val env -> Gen [C.Exp]
+    toIndex :: DelayedOpenExp env senv aenv sh -> DelayedOpenExp env senv aenv sh -> Val env -> Gen [C.Exp]
     toIndex sh ix env = do
       sh'   <- mapM use =<< cvtE sh env
       ix'   <- mapM use =<< cvtE ix env
       return [ ctoIndex sh' ix' ]
 
-    fromIndex :: DelayedOpenExp env aenv sh -> DelayedOpenExp env aenv Int -> Val env -> Gen [C.Exp]
+    fromIndex :: DelayedOpenExp env senv aenv sh -> DelayedOpenExp env senv aenv Int -> Val env -> Gen [C.Exp]
     fromIndex sh ix env = do
       sh'   <- mapM use =<< cvtE sh env
       ix'   <- cvtE ix env
@@ -711,7 +893,7 @@ codegenOpenExp dev aenv = cvtE
     --
     index :: (Shape sh, Elt e)
           => DelayedOpenAcc aenv (Array sh e)
-          -> DelayedOpenExp env aenv sh
+          -> DelayedOpenExp env senv aenv sh
           -> Val env
           -> Gen [C.Exp]
     index acc ix env
@@ -729,7 +911,7 @@ codegenOpenExp dev aenv = cvtE
 
     linearIndex :: (Shape sh, Elt e)
                 => DelayedOpenAcc aenv (Array sh e)
-                -> DelayedOpenExp env aenv Int
+                -> DelayedOpenExp env senv aenv Int
                 -> Val env
                 -> Gen [C.Exp]
     linearIndex acc ix env
@@ -761,14 +943,14 @@ codegenOpenExp dev aenv = cvtE
     -- The size of a shape, as the product of the extent in each dimension. The
     -- definition is inlined, but we could also call the C function helpers.
     --
-    shapeSize :: DelayedOpenExp env aenv sh -> Val env -> Gen [C.Exp]
+    shapeSize :: DelayedOpenExp env senv aenv sh -> Val env -> Gen [C.Exp]
     shapeSize sh env = return . csize <$> cvtE sh env
 
     -- Intersection of two shapes, taken as the minimum in each dimension.
     --
     intersect :: forall env sh. Elt sh
-              => DelayedOpenExp env aenv sh
-              -> DelayedOpenExp env aenv sh
+              => DelayedOpenExp env senv aenv sh
+              -> DelayedOpenExp env senv aenv sh
               -> Val env -> Gen [C.Exp]
     intersect sh1 sh2 env =
       zipWith (\a b -> ccall "min" [a,b]) <$> cvtE sh1 env <*> cvtE sh2 env
@@ -776,11 +958,61 @@ codegenOpenExp dev aenv = cvtE
     -- Union of two shapes, taken as the maximum in each dimension.
     --
     union :: forall env sh. Elt sh
-          => DelayedOpenExp env aenv sh
-          -> DelayedOpenExp env aenv sh
+          => DelayedOpenExp env senv aenv sh
+          -> DelayedOpenExp env senv aenv sh
           -> Val env -> Gen [C.Exp]
     union sh1 sh2 env =
       zipWith (\a b -> ccall "max" [a,b]) <$> cvtE sh1 env <*> cvtE sh2 env
+
+
+    -- Project out a single scalar element from an array. The array expression
+    -- does not contain any free scalar variables (strictly flat data
+    -- parallelism) and has been floated out to be replaced by an array index.
+    --
+    -- As we have a non-parametric array representation, be sure to bind the
+    -- linear array index as it will be used to access each component of a
+    -- tuple.
+    --
+    -- Note that after evaluating the linear array index we bind this to a fresh
+    -- variable of type 'int', so there is an implicit conversion from
+    -- Int -> Int32.
+    --
+    indexS :: forall sh e env. (Shape sh, Elt e)
+           => Idx senv (Array sh e)
+           -> DelayedOpenExp env senv aenv sh
+           -> Val env
+           -> Gen [C.Exp]
+    indexS idx ix env
+      = let (_, arr)   = namesOfSvar senv idx
+            ty         = eltType (undefined :: e)
+        in do
+        ix'     <- mapM use =<< (cchunkIndex k :) <$> cvtE ix env
+        i       <- bind cint $ ctoIndex (seqShape senv idx) ix'
+        return   $ zipWith (\t a -> indexArray dev t (cvar a) i) ty arr
+
+    linearIndexS :: forall sh e env. (Shape sh, Elt e)
+                 => Idx senv (Array sh e)
+                 -> DelayedOpenExp env senv aenv Int
+                 -> Val env
+                 -> Gen [C.Exp]
+    linearIndexS idx ix env
+      = let (_, arr)    = namesOfSvar senv idx
+            ty          = eltType (undefined :: e)
+        in do
+        ix'     <- mapM use =<< cvtE ix env
+        i       <- bind [cty| int |] $ single "LinearIndex" ix'
+        i'      <- bind cint $ [cexp| $exp:i + ($exp:k * ($exp:(cchunkIndex k))) |]
+        return   $ zipWith (\t a -> indexArray dev t (cvar a) i') ty arr
+
+    -- Array shapes created in this method refer to the shape of free array
+    -- variables. As such, they are always passed as arguments to the kernel,
+    -- not computed as part of the scalar expression. These shapes are
+    -- transferred to the kernel as a structure, and so the individual fields
+    -- need to be "unpacked", to work with our handling of tuple structures.
+    --
+    shapeS :: (Shape sh, Elt e) => Idx senv (Array sh e) -> Val env -> Gen [C.Exp]
+    shapeS idx _env
+      = return (tail (seqShape senv idx))
 
     -- Foreign scalar functions. We need to extract any header files that might
     -- be required so they can be added to the top level definitions.
@@ -790,7 +1022,7 @@ codegenOpenExp dev aenv = cvtE
     --
     foreignE :: forall f a b env. (Sugar.Foreign f, Elt a, Elt b)
              => f a b
-             -> DelayedOpenExp env aenv a
+             -> DelayedOpenExp env senv aenv a
              -> Val env
              -> Gen [C.Exp]
     foreignE ff x env = case canExecuteExp ff of
@@ -835,4 +1067,3 @@ ccastTup ty = fst . travTup ty
           (rs, xs'') = travTup r xs'
       in (ls ++ rs, xs'')
     travTup _ _ = $internalError "ccastTup" "not enough expressions to match type"
-

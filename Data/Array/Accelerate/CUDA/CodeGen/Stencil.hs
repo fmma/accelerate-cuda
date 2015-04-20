@@ -53,12 +53,12 @@ import Data.Array.Accelerate.CUDA.CodeGen.Stencil.Extra
 -- read through the texture cache.
 --
 mkStencil
-    :: forall aenv sh stencil a b. (Stencil sh a stencil, Elt b)
+    :: forall aenv senv sh stencil a b. (Stencil sh a stencil, Elt b)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun1 aenv (stencil -> b)
-    -> Boundary (CUExp aenv a)
-    -> [CUTranslSkel aenv (Array sh b)]
+    -> CUFun1 () aenv (stencil -> b)
+    -> Boundary (CUExp () aenv a)
+    -> [CUTranslSkel senv aenv (Array sh b)]
 mkStencil dev aenv (CUFun1 dce f) boundary
   = return
   $ CUTranslSkel "stencil" [cunit|
@@ -94,7 +94,7 @@ mkStencil dev aenv (CUFun1 dce f) boundary
     (sh, _, _)                  = locals "sh" (undefined :: sh)
     (xs,_,_)                    = locals "x" (undefined :: stencil)
 
-    dx  = offsets (undefined :: Fun aenv (stencil -> b))
+    dx  = offsets (undefined :: Fun () aenv (stencil -> b))
                   (undefined :: OpenAcc aenv (Array sh a))
 
     (texStencil, argStencil, safeIndex)   = stencilAccess dev True True  "Stencil" "Stencil" "w" "ix" dx boundary dce
@@ -129,29 +129,29 @@ mkStencil dev aenv (CUFun1 dce f) boundary
 --          -> Acc (Array ix c)                 -- destination array
 --
 mkStencil2
-    :: forall aenv sh stencil1 stencil2 a b c.
+    :: forall aenv senv sh stencil1 stencil2 a b c.
        (Stencil sh a stencil1, Stencil sh b stencil2, Elt c)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (stencil1 -> stencil2 -> c)
-    -> Boundary (CUExp aenv a)
-    -> Boundary (CUExp aenv b)
-    -> [CUTranslSkel aenv (Array sh c)]
+    -> CUFun2 () aenv (stencil1 -> stencil2 -> c)
+    -> Boundary (CUExp () aenv a)
+    -> Boundary (CUExp () aenv b)
+    -> [CUTranslSkel senv aenv (Array sh c)]
 mkStencil2 dev aenv stencil boundary1 boundary2
   = [ mkStencil2' dev False aenv stencil boundary1 boundary2
     , mkStencil2' dev True  aenv stencil boundary1 boundary2
     ]
 
 mkStencil2'
-    :: forall aenv sh stencil1 stencil2 a b c.
+    :: forall aenv senv sh stencil1 stencil2 a b c.
        (Stencil sh a stencil1, Stencil sh b stencil2, Elt c)
     => DeviceProperties
     -> Bool                                     -- are the source arrays the same extent?
     -> Gamma aenv
-    -> CUFun2 aenv (stencil1 -> stencil2 -> c)
-    -> Boundary (CUExp aenv a)
-    -> Boundary (CUExp aenv b)
-    -> CUTranslSkel aenv (Array sh c)
+    -> CUFun2 () aenv (stencil1 -> stencil2 -> c)
+    -> Boundary (CUExp () aenv a)
+    -> Boundary (CUExp () aenv b)
+    -> CUTranslSkel senv aenv (Array sh c)
 mkStencil2' dev sameExtent aenv (CUFun2 dce1 dce2 f) boundary1 boundary2
   = CUTranslSkel "stencil2" [cunit|
 
@@ -200,7 +200,7 @@ mkStencil2' dev sameExtent aenv (CUFun2 dce1 dce2 f) boundary1 boundary2
     sh2 | sameExtent            = sh1
         | otherwise             = grp2
 
-    (dx1, dx2)  = offsets2 (undefined :: Fun aenv (stencil1 -> stencil2 -> c))
+    (dx1, dx2)  = offsets2 (undefined :: Fun () aenv (stencil1 -> stencil2 -> c))
                            (undefined :: OpenAcc aenv (Array sh a))
                            (undefined :: OpenAcc aenv (Array sh b))
 

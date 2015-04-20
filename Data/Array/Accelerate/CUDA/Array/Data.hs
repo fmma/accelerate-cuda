@@ -20,20 +20,28 @@
 
 module Data.Array.Accelerate.CUDA.Array.Data (
 
+  PrimChunk(..),
+  chunkEltShape, chunkLength, asArray, asFlat, asArray', setPD,
+  
   -- * Array operations and representations
   mallocArray, freeArray,
   indexArray,
-  useArray,  useArrayAsync, useArraySlice,
+  useArray,  useArrayAsync,
   useDevicePtrs,
   copyArray, copyArrayAsync, copyArrayPeer, copyArrayPeerAsync,
   peekArray, peekArrayAsync,
   pokeArray, pokeArrayAsync,
+  pokeArrayInto, peekArrayFrom, pokeCopyArgs,
+  pokeArrayIntoAsync, peekArrayFromAsync, pokeCopyArgsAsync,
   marshalArrayData, marshalTextureData, marshalDevicePtrs,
   withDevicePtrs, advancePtrsOfArrayData,
   devicePtrsFromList, devicePtrsToWordPtrs,
 
   -- * Garbage collection
   cleanupArrayData,
+  
+  -- TODO clean exports
+  peekListChunk,
 
 ) where
 
@@ -52,10 +60,10 @@ import Foreign.Ptr
 -- friends
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Array.Data
-import Data.Array.Accelerate.Array.Sugar                ( Array(..), Shape, Elt, fromElt, toElt, EltRepr )
-import Data.Array.Accelerate.Array.Representation       ( size, SliceIndex )
+import Data.Array.Accelerate.Array.Sugar                ( Array(..), Shape, Elt, toElt, fromElt, EltRepr, (:.)(..), listToShape, shapeToList )
+import Data.Array.Accelerate.Array.Representation       ( size )
 import Data.Array.Accelerate.CUDA.State
-import Data.Array.Accelerate.CUDA.Array.Slice           ( TransferDesc, transferDesc )
+import Data.Array.Accelerate.CUDA.Array.Slice
 import Data.Array.Accelerate.CUDA.Array.Cache
 import Data.Array.Accelerate.CUDA.Persistent            ( KernelTable )
 import Data.Array.Accelerate.CUDA.Execute.Event         ( EventTable )
@@ -201,27 +209,6 @@ useArrayAsync (Array !sh !adata) ms = run doUse
         mkPrimDispatch(usePrim,Prim.useArrayAsync)
 
 
--- | Upload a slice of an existing array (eg. row of a matrix) to the
--- device. TODO : Bounds checking, generalize slices to more than just
--- inner dimension?
-useArraySlice :: (Elt slix, Shape sl, Shape dim, Elt e)
-              => SliceIndex (EltRepr slix) (EltRepr sl) co (EltRepr dim)
-              -> slix        -- Slice
-              -> Array dim e -- Host array
-              -> Array sl e  -- Device array
-              -> CIO ()
-useArraySlice slix sl (Array dim !adata_host) (Array _ !adata_dev) = run doUse
-  where
-    tdesc = transferDesc slix (fromElt sl) dim
-    doUse !ctx !mt = useR arrayElt adata_host adata_dev
-      where
-        useR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
-        useR ArrayEltRunit             _   _   = return ()
-        useR (ArrayEltRpair aeR1 aeR2) adh add = useR aeR1 (fst adh) (fst add) >> useR aeR2 (snd adh) (snd add)
-        useR aer                       adh add = usePrim aer ctx mt adh add tdesc -- usePrim aer ctx mt adh add tdesc
-        usePrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> ArrayData e -> TransferDesc -> IO ()
-        mkPrimDispatch(usePrim,Prim.useArraySlice)
-
 useDevicePtrs :: (Shape sh, Elt e) => EltRepr sh -> Prim.DevicePtrs (EltRepr e) -> CIO (Array sh e)
 useDevicePtrs sh ptrs = run doUse
   where
@@ -229,10 +216,10 @@ useDevicePtrs sh ptrs = run doUse
     doUse !ctx !mt = Array sh <$> useD arrayElt ptrs
       where
         useD :: ArrayEltR e -> Prim.DevicePtrs e -> IO (ArrayData e)
-        useD ArrayEltRunit             _  = return AD_Unit
-        useD (ArrayEltRpair aeR1 aeR2) ps = AD_Pair <$> useD aeR1 (P.fst ps)
-                                                    <*> useD aeR2 (P.snd ps)
-        useD aer                       ps = usePrim aer ctx mt ps n
+        useD ArrayEltRunit             _          = return AD_Unit
+        useD (ArrayEltRpair aeR1 aeR2) (ps1, ps2) = AD_Pair <$> useD aeR1 ps1
+                                                            <*> useD aeR2 ps2
+        useD aer                       ps         = usePrim aer ctx mt ps n
         --
         usePrim :: ArrayEltR e -> Context -> MemoryTable -> Prim.DevicePtrs e -> Int -> IO (ArrayData e)
         mkPrimDispatch(usePrim,Prim.useDevicePtrs)
@@ -391,6 +378,7 @@ peekArray (Array !sh !adata) = run doPeek
         peekPrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> Int -> IO ()
         mkPrimDispatch(peekPrim,Prim.peekArray)
 
+
 peekArrayAsync :: (Shape dim, Elt e) => Array dim e -> Maybe CUDA.Stream -> CIO ()
 peekArrayAsync (Array !sh !adata) !ms = run doPeek
   where
@@ -422,6 +410,132 @@ pokeArray (Array !sh !adata) = run doPoke
         pokePrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> Int -> IO ()
         mkPrimDispatch(pokePrim,Prim.pokeArray)
 
+
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+pokeArrayInto :: (Shape dim, Elt e) => Array dim e -> PrimChunk dim e -> Int -> CIO ()
+pokeArrayInto (Array !sh !adata) (PrimChunk _ _ !adata') offs = run doPoke
+  where
+    !n              = size sh
+    doPoke !ctx !mt = pokeR arrayElt adata adata'
+      where
+        pokeR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        pokeR ArrayEltRunit             _  _   = return ()
+        pokeR (ArrayEltRpair aeR1 aeR2) ad ad' = pokeR aeR1 (fst ad) (fst ad') >> pokeR aeR2 (snd ad) (snd ad')
+        pokeR aer                       ad ad' = pokePrim aer ctx mt ad ad' n (n * offs)
+        --
+        pokePrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> ArrayData e -> Int -> Int -> IO ()
+        mkPrimDispatch(pokePrim,Prim.pokeArrayInto)
+
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+pokeArrayIntoAsync :: (Shape dim, Elt e) => Array dim e -> PrimChunk dim e -> Int -> Maybe CUDA.Stream -> CIO ()
+pokeArrayIntoAsync (Array !sh !adata) (PrimChunk _ _ !adata') offs ms = run doPoke
+  where
+    !n              = size sh
+    doPoke !ctx !mt = pokeR arrayElt adata adata'
+      where
+        pokeR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        pokeR ArrayEltRunit             _  _   = return ()
+        pokeR (ArrayEltRpair aeR1 aeR2) ad ad' = pokeR aeR1 (fst ad) (fst ad') >> pokeR aeR2 (snd ad) (snd ad')
+        pokeR aer                       ad ad' = pokePrim aer ctx mt ad ad' n (n * offs) ms
+        --
+        pokePrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> ArrayData e -> Int -> Int -> Maybe CUDA.Stream -> IO ()
+        mkPrimDispatch(pokePrim,Prim.pokeArrayIntoAsync)
+
+
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+peekArrayFrom :: (Shape dim, Elt e) => PrimChunk dim e -> Array dim e -> Int -> CIO ()
+peekArrayFrom (PrimChunk _ _ !adata) (Array !sh !adata') offs = run doPeek
+  where
+    !n              = size sh
+    doPeek !ctx !mt = peekR arrayElt adata adata'
+      where
+        peekR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        peekR ArrayEltRunit             _  _   = return ()
+        peekR (ArrayEltRpair aeR1 aeR2) ad ad' = peekR aeR1 (fst ad) (fst ad') >> peekR aeR2 (snd ad) (snd ad')
+        peekR aer                       ad ad' = peekPrim aer ctx mt ad ad' n (n * offs)
+        --
+        peekPrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> ArrayData e -> Int -> Int -> IO ()
+        mkPrimDispatch(peekPrim,Prim.peekArrayFrom)
+
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+peekArrayFromAsync :: (Shape dim, Elt e) => PrimChunk dim e -> Array dim e -> Int -> Maybe CUDA.Stream -> CIO ()
+peekArrayFromAsync (PrimChunk _ _ !adata) (Array !sh !adata') offs ms = run doPeek
+  where
+    !n              = size sh
+    doPeek !ctx !mt = peekR arrayElt adata adata'
+      where
+        peekR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        peekR ArrayEltRunit             _  _   = return ()
+        peekR (ArrayEltRpair aeR1 aeR2) ad ad' = peekR aeR1 (fst ad) (fst ad') >> peekR aeR2 (snd ad) (snd ad')
+        peekR aer                       ad ad' = peekPrim aer ctx mt ad ad' n (n * offs) ms
+        --
+        peekPrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> ArrayData e -> Int -> Int -> Maybe CUDA.Stream -> IO ()
+        mkPrimDispatch(peekPrim,Prim.peekArrayFromAsync)
+
+{-
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+pokeMemcpy2D :: (Shape dim, Elt e)
+           => Memcpy2Dargs
+           -> Array dim e
+           -> Array dim e
+           -> CIO ()
+pokeMemcpy2D args (Array _ !adata) (Array _ !adata') = run doPoke
+  where
+    doPoke !ctx !mt = pokeR arrayElt adata adata'
+      where
+        pokeR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        pokeR ArrayEltRunit             _  _   = return ()
+        pokeR (ArrayEltRpair aeR1 aeR2) ad ad' = pokeR aeR1 (fst ad) (fst ad') >> pokeR aeR2 (snd ad) (snd ad')
+        pokeR aer                       ad ad' = pokePrim aer ctx mt args ad ad'
+        --
+        pokePrim :: ArrayEltR e -> Context -> MemoryTable -> Memcpy2Dargs -> ArrayData e -> ArrayData e -> IO ()
+        mkPrimDispatch(pokePrim,Prim.pokeMemcpy2D)
+-}
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+pokeCopyArgs :: Elt e
+           => CopyArgs
+           -> Array dim  e
+           -> PrimChunk dim' e 
+           -> CIO ()
+pokeCopyArgs args (Array _ !adata) (PrimChunk _ _ !adata') = run doPoke
+  where
+    doPoke !ctx !mt = pokeR arrayElt adata adata'
+      where
+        pokeR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        pokeR ArrayEltRunit             _  _   = return ()
+        pokeR (ArrayEltRpair aeR1 aeR2) ad ad' = pokeR aeR1 (fst ad) (fst ad') >> pokeR aeR2 (snd ad) (snd ad')
+        pokeR aer                       ad ad' = pokePrim aer ctx mt args ad ad'
+        --
+        pokePrim :: ArrayEltR e -> Context -> MemoryTable -> CopyArgs -> ArrayData e -> ArrayData e -> IO ()
+        mkPrimDispatch(pokePrim,Prim.pokeCopyArgs)
+
+-- Copy data from an Accelerate array into the associated device array of a different array.
+--
+pokeCopyArgsAsync :: Elt e
+           => CopyArgs
+           -> Array dim  e
+           -> PrimChunk dim' e 
+           -> Maybe CUDA.Stream
+           -> CIO ()
+pokeCopyArgsAsync args (Array _ !adata) (PrimChunk _ _ !adata') ms = run doPoke
+  where
+    doPoke !ctx !mt = pokeR arrayElt adata adata'
+      where
+        pokeR :: ArrayEltR e -> ArrayData e -> ArrayData e -> IO ()
+        pokeR ArrayEltRunit             _  _   = return ()
+        pokeR (ArrayEltRpair aeR1 aeR2) ad ad' = pokeR aeR1 (fst ad) (fst ad') >> pokeR aeR2 (snd ad) (snd ad')
+        pokeR aer                       ad ad' = pokePrim aer ctx mt args ad ad' ms
+        --
+        pokePrim :: ArrayEltR e -> Context -> MemoryTable -> CopyArgs -> ArrayData e -> ArrayData e -> Maybe CUDA.Stream -> IO ()
+        mkPrimDispatch(pokePrim,Prim.pokeCopyArgsAsync)
+
+
 pokeArrayAsync :: (Shape dim, Elt e) => Array dim e -> Maybe CUDA.Stream -> CIO ()
 pokeArrayAsync (Array !sh !adata) !ms = run doPoke
   where
@@ -435,7 +549,6 @@ pokeArrayAsync (Array !sh !adata) !ms = run doPoke
         --
         pokePrim :: ArrayEltR e -> Context -> MemoryTable -> ArrayData e -> Int -> Maybe CUDA.Stream -> IO ()
         mkPrimDispatch(pokePrim,Prim.pokeArrayAsync)
-
 
 -- |Convert the device pointers into a list of word pointers
 --
@@ -539,3 +652,43 @@ advancePtrsOfArrayData !adata !n = advanceR arrayElt adata
     advancePrim :: ArrayEltR e -> ArrayData e -> Prim.DevicePtrs e -> Prim.DevicePtrs e
     mkPrimDispatch(advancePrim,Prim.advancePtrsOfArrayData n)
 
+
+-- A chunk of an array sequence only ever lives on the device.
+-- TODO maybe move to Sugar?    
+data PrimChunk sh e = PrimChunk Int sh (ArrayData (EltRepr e))
+
+chunkEltShape :: Shape sh => PrimChunk sh e -> sh
+chunkEltShape (PrimChunk _ sh _) = sh
+
+chunkLength :: PrimChunk sh e -> Int
+chunkLength (PrimChunk n _ _) = n
+
+setPD :: Int -> PrimChunk sh e -> PrimChunk sh e
+setPD n (PrimChunk _ sh adata) = PrimChunk n sh adata
+
+asFlat :: (Shape sh, Elt e) => PrimChunk (sh :. Int) e -> Array (sh :. Int) e
+asFlat (PrimChunk n (sh :. sz) adata) = Array (fromElt (sh :. n * sz)) adata
+
+asArray :: (Shape sh, Elt e) => PrimChunk sh e -> Array (sh :. Int) e
+asArray (PrimChunk n sh adata) = Array (fromElt (n .: sh)) adata
+  where
+    (.:) :: Shape sh => Int -> sh -> (sh :. Int)
+    (.:) sz sh = listToShape (shapeToList sh ++ [sz])
+
+asArray' :: (Shape sh, Elt e) => PrimChunk sh e -> Array sh e
+asArray' (PrimChunk _ sh adata) = Array (fromElt sh) adata
+
+
+peekListChunk :: forall sh e. (Shape sh, Elt e) => PrimChunk sh e -> CIO ()
+peekListChunk (PrimChunk !k !sh !adata) = run doPeek
+  where
+    !n = k * size (fromElt sh)
+    doPeek !ctx !mt = peekR arrayElt adata
+      where
+        peekR :: ArrayEltR a -> ArrayData a -> IO ()
+        peekR ArrayEltRunit             _  = return ()
+        peekR (ArrayEltRpair aeR1 aeR2) ad = peekR aeR1 (fst ad) >> peekR aeR2 (snd ad)
+        peekR aer                       ad = peekPrim aer ctx mt n ad
+    --
+        peekPrim :: ArrayEltR a -> Context -> MemoryTable -> Int -> ArrayData a -> IO ()
+        mkPrimDispatch(peekPrim,Prim.peekListChunk)

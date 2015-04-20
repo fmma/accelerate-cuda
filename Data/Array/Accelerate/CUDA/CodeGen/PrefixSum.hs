@@ -40,10 +40,10 @@ mkScanl, mkScanr
     :: Elt e
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUExp aenv e
-    -> CUDelayedAcc aenv DIM1 e
-    -> [CUTranslSkel aenv (Vector e)]
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUExp () aenv e
+    -> CUDelayedAcc senv aenv DIM1 e
+    -> [CUTranslSkel senv aenv (Vector e)]
 mkScanl dev aenv f z a =
   [ mkScan    L dev aenv f (Just z) a
   , mkScanUp1 L dev aenv f a
@@ -58,9 +58,9 @@ mkScanl1, mkScanr1
     :: Elt e
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUDelayedAcc aenv DIM1 e
-    -> [CUTranslSkel aenv (Vector e)]
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUDelayedAcc senv aenv DIM1 e
+    -> [CUTranslSkel senv aenv (Vector e)]
 mkScanl1 dev aenv f a =
   [ mkScan    L dev aenv f Nothing a
   , mkScanUp1 L dev aenv f a
@@ -75,14 +75,14 @@ mkScanl', mkScanr'
     :: Elt e
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUExp aenv e
-    -> CUDelayedAcc aenv DIM1 e
-    -> [CUTranslSkel aenv (Vector e, Scalar e)]
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUExp () aenv e
+    -> CUDelayedAcc senv aenv DIM1 e
+    -> [CUTranslSkel senv aenv (Vector e, Scalar e)]
 mkScanl' dev aenv f z = map cast . mkScanl dev aenv f z
 mkScanr' dev aenv f z = map cast . mkScanr dev aenv f z
 
-cast :: CUTranslSkel aenv a -> CUTranslSkel aenv b
+cast :: CUTranslSkel senv aenv a -> CUTranslSkel senv aenv b
 cast (CUTranslSkel entry code) = CUTranslSkel entry code
 
 
@@ -160,14 +160,14 @@ instance Show Direction where
 --   * scanl1, scanr1 : no change (argSum is required, even though it will not be used Haskell-side)
 --   * scanl', scanr' : no change
 --
-mkScan :: forall aenv e. Elt e
+mkScan :: forall aenv senv e. Elt e
        => Direction
        -> DeviceProperties
        -> Gamma aenv
-       -> CUFun2 aenv (e -> e -> e)
-       -> Maybe (CUExp aenv e)
-       -> CUDelayedAcc aenv DIM1 e
-       -> CUTranslSkel aenv (Vector e)
+       -> CUFun2 () aenv (e -> e -> e)
+       -> Maybe (CUExp () aenv e)
+       -> CUDelayedAcc senv aenv DIM1 e
+       -> CUTranslSkel senv aenv (Vector e)
 mkScan dir dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUFun1 _ get)) =
   CUTranslSkel scan [cunit|
 
@@ -334,13 +334,13 @@ mkScan dir dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CU
 -- function were commutative, this is equivalent to a parallel tree reduction.
 --
 mkScanUp1
-    :: forall aenv e. Elt e
+    :: forall senv aenv e. Elt e
     => Direction
     -> DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUDelayedAcc aenv DIM1 e
-    -> CUTranslSkel aenv (Vector e)
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUDelayedAcc senv aenv DIM1 e
+    -> CUTranslSkel senv aenv (Vector e)
 mkScanUp1 dir dev aenv fun@(CUFun2 _ _ combine) (CUDelayed (CUExp shIn) _ (CUFun1 _ get)) =
   CUTranslSkel scan [cunit|
 
@@ -431,13 +431,13 @@ mkScanUp1 dir dev aenv fun@(CUFun2 _ _ combine) (CUDelayed (CUExp shIn) _ (CUFun
 -- values for each block of the final downsweep step
 --
 mkScanUp2
-    :: forall aenv e. Elt e
+    :: forall senv aenv e. Elt e
     => Direction
     -> DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> Maybe (CUExp aenv e)
-    -> CUTranslSkel aenv (Vector e)
+    -> CUFun2 () aenv (e -> e -> e)
+    -> Maybe (CUExp () aenv e)
+    -> CUTranslSkel senv aenv (Vector e)
 mkScanUp2 dir dev aenv f z
   = let (_, _, get) = readArray "Blk" (undefined :: Vector e)
     in  mkScan dir dev aenv f z get
@@ -449,7 +449,7 @@ mkScanUp2 dir dev aenv f z
 scanBlock
     :: forall aenv e. Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp] -> [C.Exp]
     -> (Name -> [C.Exp])
     -> Maybe C.Exp
@@ -467,7 +467,7 @@ scanBlock dev f x0 x1 x2 sdata mlim
 scanBlockTree
     :: forall aenv e. Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp] -> [C.Exp]    -- input variables x0 and x1, plus a temporary to store the intermediate value
     -> (Name -> [C.Exp])                -- index elements from shared memory
     -> Maybe C.Exp                      -- partially full block bounds check?

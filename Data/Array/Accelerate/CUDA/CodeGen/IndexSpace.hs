@@ -45,22 +45,25 @@ import Data.Array.Accelerate.CUDA.CodeGen.Base
 --          -> Acc (Array ix a)
 --
 mkGenerate
-    :: forall aenv sh e. (Shape sh, Elt e)
+    :: forall aenv senv sh e. (Shape sh, Elt e)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun1 aenv (sh -> e)
-    -> [CUTranslSkel aenv (Array sh e)]
-mkGenerate dev aenv (CUFun1 dce f)
+    -> Gamma senv
+    -> CUFun1 senv aenv (sh -> e)
+    -> [CUTranslSkel senv aenv (Array sh e)]
+mkGenerate dev aenv senv (CUFun1 dce f)
   = return
   $ CUTranslSkel "generate" [cunit|
 
     $esc:("#include <accelerate_cuda.h>")
     $edecls:texIn
+    $edecls:sTexIn
 
     extern "C" __global__ void
     generate
     (
         $params:argIn,
+        $params:sArgIn,
         $params:argOut
     )
     {
@@ -80,6 +83,7 @@ mkGenerate dev aenv (CUFun1 dce f)
   where
     (sh, _, _)                  = locals "sh" (undefined :: sh)
     (texIn, argIn)              = environment dev aenv
+    (sTexIn, sArgIn)            = environmentS dev senv
     (argOut, shOut, setOut)     = writeArray "Out" (undefined :: Array sh e)
 
 
@@ -94,14 +98,15 @@ mkGenerate dev aenv (CUFun1 dce f)
 --           -> PreOpenAcc acc aenv (Array sh' b)
 --
 mkTransform
-    :: forall aenv sh sh' a b. (Shape sh, Shape sh', Elt a, Elt b)
+    :: forall aenv senv sh sh' a b. (Shape sh, Shape sh', Elt a, Elt b)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun1 aenv (sh' -> sh)
-    -> CUFun1 aenv (a -> b)
-    -> CUDelayedAcc aenv sh a
-    -> [CUTranslSkel aenv (Array sh' b)]
-mkTransform dev aenv perm fun arr
+    -> Gamma senv
+    -> CUFun1 senv aenv (sh' -> sh)
+    -> CUFun1 senv aenv (a -> b)
+    -> CUDelayedAcc senv aenv sh a
+    -> [CUTranslSkel senv aenv (Array sh' b)]
+mkTransform dev aenv senv perm fun arr
   | CUFun1 dce_p p                      <- perm
   , CUFun1 dce_f f                      <- fun
   , CUDelayed _ (CUFun1 dce_g get) _    <- arr
@@ -110,11 +115,13 @@ mkTransform dev aenv perm fun arr
 
     $esc:("#include <accelerate_cuda.h>")
     $edecls:texIn
+    $edecls:sTexIn
 
     extern "C" __global__ void
     transform
     (
         $params:argIn,
+        $params:sArgIn,
         $params:argOut
     )
     {
@@ -135,6 +142,7 @@ mkTransform dev aenv perm fun arr
   |]
   where
     (texIn, argIn)              = environment dev aenv
+    (sTexIn, sArgIn)            = environmentS dev senv
     (argOut, shOut, setOut)     = writeArray "Out" (undefined :: Array sh' b)
     (x0, _, _)                  = locals "x"   (undefined :: a)
     (sh, _, _)                  = locals "sh"  (undefined :: sh)
@@ -158,25 +166,28 @@ mkTransform dev aenv perm fun arr
 --         -> Acc (Array ix' a)
 --
 mkPermute
-    :: forall aenv sh sh' e. (Shape sh, Shape sh', Elt e)
+    :: forall aenv senv sh sh' e. (Shape sh, Shape sh', Elt e)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUFun1 aenv (sh -> sh')
-    -> CUDelayedAcc aenv sh e
-    -> [CUTranslSkel aenv (Array sh' e)]
-mkPermute dev aenv (CUFun2 dce_x dce_y combine) (CUFun1 dce_p prj) arr
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUFun1 senv aenv (sh -> sh')
+    -> CUDelayedAcc senv aenv sh e
+    -> [CUTranslSkel senv aenv (Array sh' e)]
+mkPermute dev aenv senv (CUFun2 dce_x dce_y combine) (CUFun1 dce_p prj) arr
   | CUDelayed (CUExp shIn) _ (CUFun1 _ get) <- arr
   = return
   $ CUTranslSkel "permute" [cunit|
 
     $esc:("#include <accelerate_cuda.h>")
     $edecls:texIn
+    $edecls:sTexIn
 
     extern "C" __global__ void
     permute
     (
         $params:argIn,
+        $params:sArgIn,
         $params:argOut,
         typename Int32 * __restrict__ lock
     )
@@ -212,6 +223,7 @@ mkPermute dev aenv (CUFun2 dce_x dce_y combine) (CUFun1 dce_p prj) arr
   |]
   where
     (texIn, argIn)              = environment dev aenv
+    (sTexIn, sArgIn)            = environmentS dev senv
     (argOut, shOut, setOut)     = writeArray "Out" (undefined :: Array sh' e)
     (x, _, _)                   = locals "x" (undefined :: e)
     (y, _, _)                   = locals "y" (undefined :: e)

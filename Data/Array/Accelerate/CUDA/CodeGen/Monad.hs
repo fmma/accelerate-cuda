@@ -85,7 +85,7 @@ execCGM = fmap snd . runCGM
 -- Create new binding points for the C expressions associated with the given AST
 -- term, unless the term is itself a variable.
 --
-pushEnv :: DelayedOpenExp env aenv t -> [C.Exp] -> Gen [C.Exp]
+pushEnv :: DelayedOpenExp env senv aenv t -> [C.Exp] -> Gen [C.Exp]
 pushEnv exp cs =
   let tys               = expType exp
       zipWithM' xs ys f = zipWithM f xs ys

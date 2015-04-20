@@ -73,7 +73,7 @@ instance TypeOf (NonNumType a) where
 accType :: DelayedOpenAcc aenv (Sugar.Array dim e) -> [C.Type]
 accType = cTupleType . Sugar.delayedAccType
 
-expType :: DelayedOpenExp aenv env t -> [C.Type]
+expType :: DelayedOpenExp senv aenv env t -> [C.Type]
 expType = cTupleType . Sugar.preExpType Sugar.delayedAccType
 
 segmentsType :: DelayedOpenAcc aenv (Sugar.Segments i) -> C.Type

@@ -17,7 +17,10 @@
 
 module Data.Array.Accelerate.CUDA.CodeGen.Reduction (
 
-  mkFold, mkFold1, mkFoldSeg, mkFold1Seg,
+  mkFold, mkFold1, mkFoldSeg, mkFold1Seg, 
+  
+  -- TODO Do not export mkFoldAll', create new function mkFoldSeqFinal
+  mkFoldAll'
 
 ) where
 
@@ -53,26 +56,28 @@ import Data.Array.Accelerate.CUDA.CodeGen.Type
 -- kernel is executed once, and then the second recursively until a single value
 -- is produced.
 --
-mkFold :: forall aenv sh e. (Shape sh, Elt e)
+mkFold :: forall aenv senv sh e. (Shape sh, Elt e)
        => DeviceProperties
        -> Gamma aenv
-       -> CUFun2 aenv (e -> e -> e)
-       -> CUExp aenv e
-       -> CUDelayedAcc aenv (sh :. Int) e
-       -> [CUTranslSkel aenv (Array sh e)]
-mkFold dev aenv f z a
-  | expDim (undefined :: Exp aenv sh) > 0 = mkFoldDim dev aenv f (Just z) a
-  | otherwise                             = mkFoldAll dev aenv f (Just z) a
+       -> Gamma senv
+       -> CUFun2 () aenv (e -> e -> e)
+       -> CUExp () aenv e
+       -> CUDelayedAcc senv aenv (sh :. Int) e
+       -> [CUTranslSkel senv aenv (Array sh e)]
+mkFold dev aenv senv f z a
+  | expDim (undefined :: Exp () aenv sh) > 0 = mkFoldDim dev aenv senv f (Just z) a
+  | otherwise                                = mkFoldAll dev aenv senv f (Just z) a
 
-mkFold1 :: forall aenv sh e. (Shape sh, Elt e)
+mkFold1 :: forall aenv senv sh e. (Shape sh, Elt e)
         => DeviceProperties
         -> Gamma aenv
-        -> CUFun2 aenv (e -> e -> e)
-        -> CUDelayedAcc aenv (sh :. Int) e
-        -> [ CUTranslSkel aenv (Array sh e) ]
-mkFold1 dev aenv f a
-  | expDim (undefined :: Exp aenv sh) > 0 = mkFoldDim dev aenv f Nothing a
-  | otherwise                             = mkFoldAll dev aenv f Nothing a
+        -> Gamma senv
+        -> CUFun2 () aenv (e -> e -> e)
+        -> CUDelayedAcc senv aenv (sh :. Int) e
+        -> [ CUTranslSkel senv aenv (Array sh e) ]
+mkFold1 dev aenv senv f a
+  | expDim (undefined :: Exp () aenv sh) > 0 = mkFoldDim dev aenv senv f Nothing a
+  | otherwise                                = mkFoldAll dev aenv senv f Nothing a
 
 
 -- Reduction of an array of arbitrary rank to a single scalar value. Each thread
@@ -85,30 +90,32 @@ mkFold1 dev aenv f a
 -- recurses over a manifest array to produce a single value.
 --
 mkFoldAll
-    :: forall aenv sh e. (Shape sh, Elt e)
+    :: forall aenv senv sh e. (Shape sh, Elt e)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> Maybe (CUExp aenv e)
-    -> CUDelayedAcc aenv (sh :. Int) e
-    -> [ CUTranslSkel aenv (Array sh e) ]
-mkFoldAll dev aenv f z a
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> Maybe (CUExp () aenv e)
+    -> CUDelayedAcc senv aenv (sh :. Int) e
+    -> [ CUTranslSkel senv aenv (Array sh e) ]
+mkFoldAll dev aenv senv f z a
   = let (_, _, rec) = readArray "Rec" (undefined :: Array (sh:.Int) e)
     in
-    [ mkFoldAll' False dev aenv f z a
-    , mkFoldAll' True  dev aenv f z rec ]
+    [ mkFoldAll' False dev aenv senv f z a
+    , mkFoldAll' True  dev aenv senv f z rec ]
 
 
 mkFoldAll'
-    :: forall aenv sh e. (Shape sh, Elt e)
+    :: forall aenv senv sh e. (Shape sh, Elt e)
     => Bool
     -> DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> Maybe (CUExp aenv e)
-    -> CUDelayedAcc aenv (sh :. Int) e
-    -> CUTranslSkel aenv (Array sh e)
-mkFoldAll' recursive dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUFun1 _ get))
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> Maybe (CUExp () aenv e)
+    -> CUDelayedAcc senv aenv (sh :. Int) e
+    -> CUTranslSkel senv aenv (Array sh e)
+mkFoldAll' recursive dev aenv senv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUFun1 _ get))
   = CUTranslSkel foldAll [cunit|
 
     $esc:("#include <accelerate_cuda.h>")
@@ -118,6 +125,7 @@ mkFoldAll' recursive dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp s
     $id:foldAll
     (
         $params:argIn,
+        $params:sArgIn,
         $params:argOut,
         $params:argRec
     )
@@ -187,6 +195,7 @@ mkFoldAll' recursive dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp s
   where
     foldAll                     = maybe "fold1All" (const "foldAll") mseed
     (texIn, argIn)              = environment dev aenv
+    (sTexIn, sArgIn)            = environmentS dev senv
     (argOut, _, setOut)         = writeArray "Out" (undefined :: Array (sh :. Int) e)
     (argRec, _, _)
       | recursive               = readArray "Rec" (undefined :: Array (sh :. Int) e)
@@ -219,14 +228,15 @@ mkFoldAll' recursive dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp s
 -- thread block reduces along one innermost dimension index.
 --
 mkFoldDim
-    :: forall aenv sh e. (Shape sh, Elt e)
+    :: forall aenv senv sh e. (Shape sh, Elt e)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> Maybe (CUExp aenv e)
-    -> CUDelayedAcc aenv (sh :. Int) e
-    -> [ CUTranslSkel aenv (Array sh e) ]
-mkFoldDim dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUFun1 _ get))
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> Maybe (CUExp () aenv e)
+    -> CUDelayedAcc senv aenv (sh :. Int) e
+    -> [ CUTranslSkel senv aenv (Array sh e) ]
+mkFoldDim dev aenv senv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUFun1 _ get))
   = return
   $ CUTranslSkel fold [cunit|
 
@@ -237,6 +247,7 @@ mkFoldDim dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUF
     $id:fold
     (
         $params:argIn,
+        $params:sArgIn,
         $params:argOut
     )
     {
@@ -340,6 +351,7 @@ mkFoldDim dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp shIn) _ (CUF
   where
     fold                        = maybe "fold1" (const "fold") mseed
     (texIn, argIn)              = environment dev aenv
+    (sTexIn, sArgIn)            = environmentS dev senv
     (argOut, shOut, setOut)     = writeArray "Out" (undefined :: Array sh e)
     (_, x, declx)               = locals "x" (undefined :: e)
     (_, y, decly)               = locals "y" (undefined :: e)
@@ -400,34 +412,37 @@ mkFoldSeg
     :: (Shape sh, Elt e, Elt i, IsIntegral i)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUExp aenv e
-    -> CUDelayedAcc aenv (sh :. Int) e
-    -> CUDelayedAcc aenv (Z  :. Int) i
-    -> [CUTranslSkel aenv (Array (sh :. Int) e)]
-mkFoldSeg dev aenv f z a s = [ mkFoldSeg' dev aenv f (Just z) a s ]
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUExp () aenv e
+    -> CUDelayedAcc senv aenv (sh :. Int) e
+    -> CUDelayedAcc senv aenv (Z  :. Int) i
+    -> [CUTranslSkel senv aenv (Array (sh :. Int) e)]
+mkFoldSeg dev aenv senv f z a s = [ mkFoldSeg' dev aenv senv f (Just z) a s ]
 
 mkFold1Seg
     :: (Shape sh, Elt e, Elt i, IsIntegral i)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> CUDelayedAcc aenv (sh :. Int) e
-    -> CUDelayedAcc aenv (Z  :. Int) i
-    -> [CUTranslSkel aenv (Array (sh :. Int) e)]
-mkFold1Seg dev aenv f a s = [ mkFoldSeg' dev aenv f Nothing a s ]
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> CUDelayedAcc senv aenv (sh :. Int) e
+    -> CUDelayedAcc senv aenv (Z  :. Int) i
+    -> [CUTranslSkel senv aenv (Array (sh :. Int) e)]
+mkFold1Seg dev aenv senv f a s = [ mkFoldSeg' dev aenv senv f Nothing a s ]
 
 
 mkFoldSeg'
-    :: forall aenv sh e i. (Shape sh, Elt e, Elt i, IsIntegral i)
+    :: forall aenv senv sh e i. (Shape sh, Elt e, Elt i, IsIntegral i)
     => DeviceProperties
     -> Gamma aenv
-    -> CUFun2 aenv (e -> e -> e)
-    -> Maybe (CUExp aenv e)
-    -> CUDelayedAcc aenv (sh :. Int) e
-    -> CUDelayedAcc aenv (Z  :. Int) i
-    -> CUTranslSkel aenv (Array (sh :. Int) e)
-mkFoldSeg' dev aenv fun@(CUFun2 _ _ combine) mseed
+    -> Gamma senv
+    -> CUFun2 () aenv (e -> e -> e)
+    -> Maybe (CUExp () aenv e)
+    -> CUDelayedAcc senv aenv (sh :. Int) e
+    -> CUDelayedAcc senv aenv (Z  :. Int) i
+    -> CUTranslSkel senv aenv (Array (sh :. Int) e)
+mkFoldSeg' dev aenv senv fun@(CUFun2 _ _ combine) mseed
   (CUDelayed (CUExp shIn) _ (CUFun1 _ get))
   (CUDelayed _            _ (CUFun1 _ offset))
   = CUTranslSkel foldSeg [cunit|
@@ -440,6 +455,7 @@ mkFoldSeg' dev aenv fun@(CUFun2 _ _ combine) mseed
     $id:foldSeg
     (
         $params:argIn,
+        $params:sArgIn,
         $params:argOut
     )
     {
@@ -553,6 +569,7 @@ mkFoldSeg' dev aenv fun@(CUFun2 _ _ combine) mseed
   where
     foldSeg                     = maybe "fold1Seg" (const "foldSeg") mseed
     (texIn, argIn)              = environment dev aenv
+    (sTexIn, sArgIn)            = environmentS dev senv
     (argOut, shOut, setOut)     = writeArray "Out" (undefined :: Array (sh :. Int) e)
     (_, x, declx)               = locals "x" (undefined :: e)
     (_, y, decly)               = locals "y" (undefined :: e)
@@ -585,7 +602,7 @@ mkFoldSeg' dev aenv fun@(CUFun2 _ _ combine) mseed
 reduceWarp
     :: forall aenv e. Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp] -> [C.Exp]    -- input variables x0 and x1, plus a temporary to store the intermediate result
     -> (Name -> [C.Exp])                -- index elements from shared memory
     -> C.Exp                            -- number of elements
@@ -600,7 +617,7 @@ reduceWarp dev fun x0 x1 x2 sdata n tid
 reduceBlock
     :: forall aenv e. Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp] -> [C.Exp]    -- input variables x0 and x1, plus a temporary to store the intermediate result
     -> (Name -> [C.Exp])                -- index elements from shared memory
     -> C.Exp                            -- number of elements
@@ -616,7 +633,7 @@ reduceBlock dev fun x0 x1 x2 sdata n
 reduceWarpTree
     :: Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp] -> [C.Exp]    -- input variables x0 and x1, plus a temporary to store the intermediate result
     -> (Name -> [C.Exp])                -- index elements from shared memory
     -> C.Exp                            -- number of elements
@@ -648,7 +665,7 @@ reduceWarpTree dev (CUFun2 _ _ f) x0 x1 x2 sdata n tid
 reduceBlockTree
     :: Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp] -> [C.Exp]    -- input variables x0 and x1, plus a temporary to store the intermediate result
     -> (Name -> [C.Exp])                -- index elements from shared memory
     -> C.Exp                            -- number of elements
@@ -716,7 +733,7 @@ shflOK _dev _ = False
 reduceWarpShfl
     :: forall aenv e. Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp]
     -> C.Exp
     -> C.Exp
@@ -746,7 +763,7 @@ reduceWarpShfl _dev (CUFun2 _ _ f) x0 x1 n tid
 reduceBlockShfl
     :: forall aenv e. Elt e
     => DeviceProperties
-    -> CUFun2 aenv (e -> e -> e)
+    -> CUFun2 () aenv (e -> e -> e)
     -> [C.Exp] -> [C.Exp]
     -> (Name -> [C.Exp])
     -> C.Exp

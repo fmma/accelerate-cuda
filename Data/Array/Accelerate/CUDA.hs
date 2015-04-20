@@ -208,7 +208,6 @@ import System.IO.Unsafe
 -- friends
 import Data.Array.Accelerate.Trafo
 import Data.Array.Accelerate.Smart                      ( Acc, Seq )
-import Data.Array.Accelerate                            ( mapSeq, streamIn )
 import Data.Array.Accelerate.Array.Sugar                ( Arrays(..), ArraysR(..) )
 import Data.Array.Accelerate.CUDA.Array.Data
 import Data.Array.Accelerate.CUDA.Async
@@ -353,8 +352,9 @@ stream f arrs
 -- | As 'stream', but execute in the specified context.
 --
 streamWith :: (Arrays a, Arrays b) => Context -> (Acc a -> Acc b) -> [a] -> [b]
-streamWith ctx f
-  = streamOutWith ctx . mapSeq f . streamIn
+streamWith ctx f arrs
+  = let go = run1With ctx f
+    in  map go arrs
 
 -- | Generate a lazy list from a sequence computation.
 --
@@ -362,23 +362,11 @@ streamOut :: Arrays a => Seq [a] -> [a]
 streamOut = streamOutWith defaultContext
 
 streamOutWith :: forall a. Arrays a => Context -> Seq [a] -> [a]
-streamOutWith ctx = exec . compile . convertSeq
+streamOutWith ctx s = go ls
   where
-    compile     = unsafePerformIO . evalCUDA ctx . compileSeq
-    exec s      = go (streamSeq s)
-      where
-        go !s' = case step s' of
-          Nothing       -> []
-          Just (a, s'') -> a : go s''
-
-        step (StreamSeq ss)
-          = unsafePerformIO
-          $ evalCUDA ctx
-          $ do m <- ss
-               case m of
-                 Nothing      -> return Nothing
-                 Just (a, s') -> collect a >> return (Just (a, s'))
-
+    !ls = unsafePerformIO $ evalCUDA ctx (streamSeq =<< compileSeq (convertSeq s))
+    go Done = []
+    go (Yield as ls) = as ++ go (unsafePerformIO $ evalCUDA ctx ls)
 
 -- RCE: Similar to run1* variants, we need to be ultra careful with streamOut*
 -- in order to make sure that the entire sequence is not reified at once.
@@ -408,7 +396,6 @@ config =  Phase
   , floatOutAccFromExp     = True
   , enableAccFusion        = True
   , convertOffsetOfSegment = True
-  , vectoriseSequences     = False
   }
 
 

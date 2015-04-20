@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE CPP                        #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GADTs                      #-}
 {-# LANGUAGE IncoherentInstances        #-}
@@ -29,14 +30,19 @@ module Data.Array.Accelerate.CUDA.Execute (
   executeAcc, executeAfun1,
 
   -- * Executing a sequence computation and streaming its output.
-  StreamSeq(..), streamSeq,
+  LazySeq(..), streamSeq,
 
 ) where
+
+-- TODO cleanup
+import Data.Typeable
+import Data.Monoid ( mempty )
 
 -- friends
 import Data.Array.Accelerate.CUDA.AST
 import Data.Array.Accelerate.CUDA.State
 import Data.Array.Accelerate.CUDA.Array.Data
+import Data.Array.Accelerate.CUDA.Array.Slice                   ( copyArgs )
 import Data.Array.Accelerate.CUDA.Array.Sugar
 import Data.Array.Accelerate.CUDA.Foreign.Import                ( canExecuteAcc )
 import Data.Array.Accelerate.CUDA.CodeGen.Base                  ( Name, namesOfArray, groupOfInt )
@@ -63,10 +69,9 @@ import Control.Applicative                                      hiding ( Const )
 import Control.Monad                                            ( join, when, liftM )
 import Control.Monad.Reader                                     ( asks )
 import Control.Monad.State                                      ( gets )
-import Control.Monad.Trans                                      ( MonadIO, liftIO, lift )
-import Control.Monad.Trans.Maybe                                ( MaybeT(..), runMaybeT )
+import Control.Monad.Trans                                      ( MonadIO, liftIO )
 import Control.Monad.Trans.Cont                                 ( ContT(..), evalContT )
-import System.IO.Unsafe                                         ( unsafeInterleaveIO )
+import System.IO.Unsafe                                         ( unsafeInterleaveIO, unsafePerformIO )
 import Data.Int
 import Data.Word
 
@@ -78,19 +83,66 @@ import qualified Data.HashMap.Strict                            as Map
 -- Asynchronous kernel execution
 -- -----------------------------
 
+-- A suspended sequence computation.
+data LazySeq a = Done | Yield [a] (CIO (LazySeq a))
+
+indexLast :: Shape sh => (sh :. Int) -> Int
+indexLast = last . shapeToList
+
+indexInit :: Shape sh => (sh :. Int) -> sh
+indexInit = listToShape . init . shapeToList
+
+infixr 3 .:
+(.:) :: Shape sh => Int -> sh -> (sh :. Int)
+(.:) n sh = listToShape (shapeToList sh ++ [n])
+
+type Val' senv = (Sval senv, Int)
+
+-- Valuation for an environment of sequence windows.
+--
+data Sval senv where
+  Sempty :: Sval ()
+  Spush  :: Sval senv -> Async (PrimChunk sh e) -> Sval (senv, Array sh e)
+
+-- Projection of a window from a window valuation using a de Bruijn
+-- index.
+--
+sprj :: Idx senv (Array sh e) -> Sval senv -> Async (PrimChunk sh e)
+sprj ZeroIdx       (Spush _   v) = v
+sprj (SuccIdx idx) (Spush val _) = sprj idx val
+sprj _             _             = $internalError "prj" "inconsistent valuation"
+
+
+
+sval :: Val' senv -> Sval senv
+sval = fst
+
+senvSize :: Val' senv -> Int
+senvSize = snd
+
+
+-- Projection of a window from a window valuation using a de Bruijn
+-- index.
+--
+prj' :: Idx senv (Array sh e) -> Val' senv -> Async (PrimChunk sh e)
+prj' x (senv, _) = sprj x senv
+
+push' :: Val' senv -> Async (PrimChunk sh e) -> Val' (senv, Array sh e)
+push' (senv, n) c = (Spush senv c, n)
+
 -- Arrays with an associated CUDA Event that will be signalled once the
 -- computation has completed.
 --
 data Async a = Async {-# UNPACK #-} !Event !a
+
+instance Functor Async where
+  fmap f (Async ev a) = Async ev (f a)
 
 -- Valuation for an environment of asynchronous array computations
 --
 data Aval env where
   Aempty :: Aval ()
   Apush  :: Aval env -> Async t -> Aval (env, t)
-
--- A suspended sequence computation.
-newtype StreamSeq a = StreamSeq (CIO (Maybe (a, StreamSeq a)))
 
 -- Projection of a value from a valuation using a de Bruijn index.
 --
@@ -99,14 +151,12 @@ aprj ZeroIdx       (Apush _   x) = x
 aprj (SuccIdx idx) (Apush val _) = aprj idx val
 aprj _             _             = $internalError "aprj" "inconsistent valuation"
 
-
 -- All work submitted to the given stream will occur after the asynchronous
 -- event for the given array has been fulfilled. Synchronisation is performed
 -- efficiently on the device. This function returns immediately.
 --
 after :: MonadIO m => Stream -> Async a -> m a
 after stream (Async event arr) = liftIO $ Event.after event stream >> return arr
-
 
 -- Block the calling thread until the event for the given array computation
 -- is recorded.
@@ -123,6 +173,16 @@ streaming first second = do
   reservoir <- gets streamReservoir
   table     <- gets eventTable
   Stream.streaming context reservoir table first (\e a -> second (Async e a))
+
+
+-- Execute the given computation in a unique execution stream.
+-- TODO
+streaming' :: (Stream -> CIO a) -> (Async a -> CIO () -> CIO b) -> CIO b
+streaming' first second = do
+  context   <- asks activeContext
+  reservoir <- gets streamReservoir
+  table     <- gets eventTable
+  Stream.streaming' context reservoir table first (\e a -> second (Async e a))
 
 
 -- Array expression evaluation
@@ -160,6 +220,10 @@ executeOpenAfun1 :: PreOpenAfun ExecOpenAcc aenv (a -> b) -> Aval aenv -> Async 
 executeOpenAfun1 (Alam (Abody f)) aenv x = streaming (executeOpenAcc f (aenv `Apush` x)) wait
 executeOpenAfun1 _                _    _ = error "the sword comes out after you swallow it, right?"
 
+executeOpenAfun2 :: PreOpenAfun ExecOpenAcc aenv (a -> b -> c) -> Aval aenv -> Async a -> Async b -> CIO c
+executeOpenAfun2 (Alam (Alam (Abody f))) aenv x y = streaming (executeOpenAcc f (aenv `Apush` x `Apush` y)) wait
+executeOpenAfun2 _                       _    _ _ = error "the sword comes out after you swallow it, right?"
+
 
 -- Evaluate an open array computation
 --
@@ -172,13 +236,14 @@ executeOpenAcc
 executeOpenAcc EmbedAcc{} _ _
   = $internalError "execute" "unexpected delayed array"
 executeOpenAcc (ExecSeq l)                                !aenv !stream
-  = executeSequence l aenv stream
+  = executeSequence defaultSeqConfig l aenv stream
 executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
   = case pacc of
 
       -- Array introduction
       Use arr                   -> return (toArr arr)
       Unit x                    -> newArray Z . const =<< travE x
+      Reshape sh a              -> reshapeOp <$> travE sh <*> travA a
 
       -- Environment manipulation
       Avar ix                   -> after stream (aprj ix aenv)
@@ -192,33 +257,35 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
       -- Foreign
       Aforeign ff afun a        -> aforeign ff afun =<< travA a
 
-      -- Producers
-      Map _ a                   -> executeOp =<< extent a
-      Generate sh _             -> executeOp =<< travE sh
-      Transform sh _ _ _        -> executeOp =<< travE sh
-      Backpermute sh _ _        -> executeOp =<< travE sh
-      Reshape sh a              -> reshapeOp <$> travE sh <*> travA a
-
-      -- Consumers
-      Fold _ _ a                -> foldOp  =<< extent a
-      Fold1 _ a                 -> fold1Op =<< extent a
-      FoldSeg _ _ a s           -> join $ foldSegOp <$> extent a <*> extent s
-      Fold1Seg _ a s            -> join $ foldSegOp <$> extent a <*> extent s
-      Scanl1 _ a                -> scan1Op =<< extent a
-      Scanr1 _ a                -> scan1Op =<< extent a
-      Scanl' _ _ a              -> scan'Op =<< extent a
-      Scanr' _ _ a              -> scan'Op =<< extent a
-      Scanl _ _ a               -> scanOp True  =<< extent a
-      Scanr _ _ a               -> scanOp False =<< extent a
-      Permute _ d _ a           -> join $ permuteOp <$> extent a <*> travA d
-      Stencil _ _ a             -> stencilOp =<< travA a
-      Stencil2 _ _ a1 _ a2      -> join $ stencil2Op <$> travA a1 <*> travA a2
-
-      -- AST nodes that should be inaccessible at this point
-      Replicate{}               -> fusionError
-      Slice{}                   -> fusionError
-      ZipWith{}                 -> fusionError
       Collect{}                 -> streamingError
+      ArrayOp op                ->
+        case op of
+
+          -- Producers
+          Map _ a                   -> executeOp =<< extent a
+          Generate sh _             -> executeOp =<< travE sh
+          Transform sh _ _ _        -> executeOp =<< travE sh
+          Backpermute sh _ _        -> executeOp =<< travE sh
+
+          -- Consumers
+          Fold _ _ a                -> foldOp  =<< extent a
+          Fold1 _ a                 -> fold1Op =<< extent a
+          FoldSeg _ _ a s           -> join $ foldSegOp <$> extent a <*> extent s
+          Fold1Seg _ a s            -> join $ foldSegOp <$> extent a <*> extent s
+          Scanl1 _ a                -> scan1Op =<< extent a
+          Scanr1 _ a                -> scan1Op =<< extent a
+          Scanl' _ _ a              -> scan'Op =<< extent a
+          Scanr' _ _ a              -> scan'Op =<< extent a
+          Scanl _ _ a               -> scanOp True  =<< extent a
+          Scanr _ _ a               -> scanOp False =<< extent a
+          Permute _ d _ a           -> join $ permuteOp <$> extent a <*> travA d
+          Stencil _ _ a             -> stencilOp =<< travA a
+          Stencil2 _ _ a1 _ a2      -> join $ stencil2Op <$> travA a1 <*> travA a2
+
+          -- AST nodes that should be inaccessible at this point
+          Replicate{}               -> fusionError
+          Slice{}                   -> fusionError
+          ZipWith{}                 -> fusionError
 
   where
     fusionError    = $internalError "executeOpenAcc" "unexpected fusible matter"
@@ -228,7 +295,7 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
     travA :: ExecOpenAcc aenv a -> CIO a
     travA !acc = executeOpenAcc acc aenv stream
 
-    travE :: ExecExp aenv t -> CIO t
+    travE :: ExecExp () aenv t -> CIO t
     travE !exp = executeExp exp aenv stream
 
     travT :: Atuple (ExecOpenAcc aenv) t -> CIO t
@@ -265,7 +332,7 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
     executeOp :: (Shape sh, Elt e) => sh -> CIO (Array sh e)
     executeOp !sh = do
       out       <- allocateArray sh
-      execute kernel gamma aenv (size sh) out stream
+      execute kernel gamma aenv mempty (Sempty, 1) (size sh) out stream
       return out
 
     -- Change the shape of an array without altering its contents. This does not
@@ -289,30 +356,30 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
     foldOp !(!sh :. sz)
       = foldCore ((listToShape . map (max 1) . shapeToList $ sh) :. sz)
 
-    foldCore :: (Shape sh, Elt e) => (sh :. Int) -> CIO (Array sh e)
+    foldCore :: forall sh e. (Shape sh, Elt e) => (sh :. Int) -> CIO (Array sh e)
     foldCore !(!sh :. sz)
       | dim sh > 0              = executeOp sh
-      | otherwise
-      = let !numElements        = size sh * sz
+      | Just (Refl :: sh :~: Z) <- eqT -- FMMA TODO change back to "otherwise" (see version on Github)
+      = let !numElements        = sz
             (_,!numBlocks,_)    = configure kernel numElements
         in do
-          out   <- allocateArray (sh :. numBlocks)
-          execute kernel gamma aenv numElements out stream
+          out   <- allocateArray (Z :. numBlocks)
+          execute kernel gamma aenv mempty (Sempty, 1) numElements out stream
           foldRec out
 
     -- Recursive step(s) of a multi-block reduction
     --
-    foldRec :: (Shape sh, Elt e) => Array (sh:.Int) e -> CIO (Array sh e)
+    foldRec :: Elt e => Vector e -> CIO (Scalar e)
     foldRec arr@(Array _ !adata)
       | Cons _ rec _ <- more
-      = let sh :. sz            = shape arr
-            !numElements        = size sh * sz
+      = let Z :. sz             = shape arr
+            !numElements        = sz
             (_,!numBlocks,_)    = configure rec numElements
         in if sz <= 1
-              then return $ Array (fromElt sh) adata
+              then return $ Array () adata
               else do
-                out     <- allocateArray (sh :. numBlocks)
-                execute rec gamma aenv numElements (out, arr) stream
+                out     <- allocateArray (Z :. numBlocks)
+                execute rec gamma aenv mempty (Sempty, 1) numElements (out, arr) stream
                 foldRec out
 
       | otherwise
@@ -323,6 +390,16 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
     --
     foldSegOp :: (Shape sh, Elt e) => (sh :. Int) -> (Z :. Int) -> CIO (Array (sh :. Int) e)
     foldSegOp (!sh :. _) !(Z :. sz) = executeOp (sh :. sz - 1)
+
+    scanCore
+        :: forall e. Elt e
+        => Int
+        -> Vector e                     -- to fix Elt vs. EltRepr
+        -> Prim.DevicePtrs (EltRepr e)
+        -> Prim.DevicePtrs (EltRepr e)
+        -> CIO ()
+    scanCore = scanCore' (FL () kernel more) gamma aenv stream
+
 
     -- Scans, all variations on a theme.
     --
@@ -356,36 +433,6 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
           scanCore numElements vec d_vec d_sum
           return (vec, sum)
 
-    scanCore
-        :: forall e. Elt e
-        => Int
-        -> Vector e                     -- to fix Elt vs. EltRepr
-        -> Prim.DevicePtrs (EltRepr e)
-        -> Prim.DevicePtrs (EltRepr e)
-        -> CIO ()
-    scanCore !numElements (Array _ !adata) !body !sum
-      | Cons _ !upsweep1 (Cons _ !upsweep2 _) <- more
-      = let (_,!numIntervals,_) = configure kernel numElements
-            !d_body             = marshalDevicePtrs adata body
-            !d_sum              = marshalDevicePtrs adata sum
-        in do
-          blk   <- allocateArray (Z :. numIntervals) :: CIO (Vector e)
-
-          -- Phase 1: Split the array over multiple thread blocks and calculate
-          --          the final scan result from each interval.
-          --
-          when (numIntervals > 1) $ do
-            execute upsweep1 gamma aenv numElements blk stream
-            execute upsweep2 gamma aenv numIntervals (blk, blk, d_sum) stream
-
-          -- Phase 2: Re-scan the input using the carry-in value from each
-          --          interval sum calculated in phase 1.
-          --
-          execute kernel gamma aenv numElements (numElements, d_body, blk, d_sum) stream
-
-      | otherwise
-      = $internalError "scanOp" "missing multi-block kernel module(s)"
-
     -- Forward permutation
     --
     permuteOp :: forall sh sh' e. (Shape sh, Shape sh', Elt e) => sh -> Array sh' e -> CIO (Array sh' e)
@@ -399,7 +446,7 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
 
         liftIO $ CUDA.memsetAsync d_locks n' 0 (Just stream)      -- TLM: overlap these two operations?
         copyArrayAsync dfs out (Just stream)
-        execute kernel gamma aenv (size sh) (out, d_locks) stream
+        execute kernel gamma aenv mempty (Sempty, 1) (size sh) (out, d_locks) stream
         return out
 
     -- Stencil operations. NOTE: the arguments to 'namesOfArray' must be the
@@ -413,9 +460,9 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
 
       if computeCapability dev < Compute 2 0
          then marshalAccTex (namesOfArray "Stencil" (undefined :: a)) kernel arr (Just stream) $
-                execute kernel gamma aenv (size sh) (out, sh) stream
-         else execute kernel gamma aenv (size sh) (out, arr) stream
-      execute kernel gamma aenv (size sh) (out, arr) stream
+                execute kernel gamma aenv mempty (Sempty, 1) (size sh) (out, sh) stream
+         else execute kernel gamma aenv mempty (Sempty, 1) (size sh) (out, arr) stream
+      execute kernel gamma aenv mempty (Sempty, 1) (size sh) (out, arr) stream
       --
       return out
 
@@ -435,9 +482,9 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
           if computeCapability dev < Compute 2 0
              then marshalAccTex (namesOfArray "Stencil1" (undefined :: a)) op arr1 (Just stream) $
                   marshalAccTex (namesOfArray "Stencil2" (undefined :: b)) op arr2 (Just stream) $
-                  execute op gamma aenv (size sh) (out, sh1,  sh2) stream
-             else execute op gamma aenv (size sh) (out, arr1, arr2) stream
-          execute op gamma aenv (size sh) (out, arr1, arr2) stream
+                  execute op gamma aenv mempty (Sempty, 1) (size sh) (out, sh1,  sh2) stream
+             else execute op gamma aenv mempty (Sempty, 1) (size sh) (out, arr1, arr2) stream
+          execute op gamma aenv mempty (Sempty, 1) (size sh) (out, arr1, arr2) stream
           --
           return out
 
@@ -445,242 +492,517 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
       = $internalError "stencil2Op" "missing stencil specialisation kernel"
 
 
--- Execute a streaming computation
+scanCore'
+        :: forall aenv e a. Elt e
+        => FullList () (AccKernel a)   -- executable binary objects
+        -> Gamma aenv                  -- free array variables the kernel needs access to
+        -> Aval aenv
+        -> Stream
+        -> Int
+        -> Vector e                     -- to fix Elt vs. EltRepr
+        -> Prim.DevicePtrs (EltRepr e)
+        -> Prim.DevicePtrs (EltRepr e)
+        -> CIO ()
+scanCore' (FL () kernel more) !gamma !aenv !stream !numElements (Array _ !adata) !body !sum
+      | Cons _ !upsweep1 (Cons _ !upsweep2 _) <- more
+      = let (_,!numIntervals,_) = configure kernel numElements
+            !d_body             = marshalDevicePtrs adata body
+            !d_sum              = marshalDevicePtrs adata sum
+        in do
+          blk   <- allocateArray (Z :. numIntervals) :: CIO (Vector e)
+
+          -- Phase 1: Split the array over multiple thread blocks and calculate
+          --          the final scan result from each interval.
+          --
+          when (numIntervals > 1) $ do
+            execute upsweep1 gamma aenv mempty (Sempty, 1) numElements blk stream
+            execute upsweep2 gamma aenv mempty (Sempty, 1) numIntervals (blk, blk, d_sum) stream
+
+          -- Phase 2: Re-scan the input using the carry-in value from each
+          --          interval sum calculated in phase 1.
+          --
+          execute kernel gamma aenv mempty (Sempty, 1) numElements (numElements, d_body, blk, d_sum) stream
+
+      | otherwise
+      = $internalError "scanOp" "missing multi-block kernel module(s)"
+
+
+
+-- Configuration for sequence evaluation.
 --
-executeSequence :: forall aenv arrs . Arrays arrs => ExecOpenSeq aenv () arrs -> Aval aenv -> Stream -> CIO arrs
-executeSequence topSequence aenv stream
-  = initializeOpenSeq topSequence aenv stream >>= loop >>= returnOut
-  where
-    loop :: ExecOpenSeq aenv () arrs -> CIO (ExecOpenSeq aenv () arrs)
-    loop = loop'
-      where
-        loop' :: ExecOpenSeq aenv () arrs -> CIO (ExecOpenSeq aenv () arrs)
-        loop' s = do
-           ms <- runMaybeT (stepOpenSeq aenv s stream)
-           case ms of
-             Nothing -> return s
-             Just s' -> loop' s'
+data SeqConfig = SeqConfig
+  { chunkSize :: Int -- Allocation limit for a sequence in
+                     -- words. Actual runtime allocation should be the
+                     -- maximum of this size and the size of the
+                     -- largest element in the sequence.
+  }
 
-    returnOut :: forall lenv arrs' . ExecOpenSeq aenv lenv arrs' -> CIO arrs'
-    returnOut !l =
-      case l of
-        ExecP _ l' -> returnOut l'
-        ExecC c    -> readConsumer c
-        ExecR _ ma -> case ma of
-                         Just a -> return [a]
-                         Nothing -> $internalError "executeSequence" "Expected already executed Sequence"
-
-      where
-        readConsumer :: forall a . ExecC aenv lenv a -> CIO a
-        readConsumer c =
-          case c of
-            ExecFoldSeq _ _ _ (Just a) -> let a' = fromList Z [a] in useArray a' >> return a'
-            ExecFoldSeqFlatten _ _ _ (Just a) -> return a
-            ExecStuple t -> toAtuple <$> rdT t
-              where
-                rdT :: forall t. Atuple (ExecC aenv lenv) t -> CIO t
-                rdT NilAtup          = return ()
-                rdT (SnocAtup t' c') = (,) <$> rdT t' <*> readConsumer c'
-            _ -> $internalError "executeSequence" "Expected already executed consumer"
-
-initializeSeq :: Aval aenv -> ExecOpenSeq aenv () arrs' -> CIO (ExecOpenSeq aenv () arrs')
-initializeSeq aenv s = streaming (initializeOpenSeq s aenv) wait
-
-initializeOpenSeq :: forall lenv aenv arrs' . ExecOpenSeq aenv lenv arrs' -> Aval aenv -> Stream -> CIO (ExecOpenSeq aenv lenv arrs')
-initializeOpenSeq l aenv stream =
-  case l of
-    ExecP p l' -> ExecP <$> initP p <*> initializeOpenSeq l' aenv stream
-    ExecC c    -> ExecC <$> initC c
-    ExecR ix a -> return (ExecR ix a)
-
-  where
-    initP :: forall a. ExecP aenv lenv a -> CIO (ExecP aenv lenv a)
-    initP (ExecToSeq slix acc k g (_::[slix])) =
-      do sh <- extent acc
-         --Lazy evaluation will stop this entire list being generated.
-         let slices = enumSlices slix sh :: [slix]
-         return $ ExecToSeq slix acc k g slices
-    initP (ExecUseLazy slix arr (_::[slix])) =
-      let sh = shape arr
-          -- Same as above.
-          slices = enumSlices slix sh :: [slix]
-      in return $ ExecUseLazy slix arr slices
-    initP s@ExecStreamIn{} = return s
-    initP s@ExecMap{} = return s
-    initP s@ExecZipWith{} = return s
-    initP (ExecScanSeq f a0 ix _) =
-          do a <- executeExp a0 aenv stream
-             return $ ExecScanSeq f a0 ix (Just a)
-
-    initC :: forall a. ExecC aenv lenv a -> CIO (ExecC aenv lenv a)
-    initC c =
-      case c of
-        ExecFoldSeq f a0 ix _ ->
-          do a <- executeExp a0 aenv stream
-             return $ ExecFoldSeq f a0 ix (Just a)
-        ExecFoldSeqFlatten afun acc ix _ ->
-          do a <- executeOpenAcc acc aenv stream
-             return $ ExecFoldSeqFlatten afun acc ix (Just a)
-        ExecStuple t  -> ExecStuple <$> initCT t
-
-    initCT :: forall t. Atuple (ExecC aenv lenv) t -> CIO (Atuple (ExecC aenv lenv) t)
-    initCT NilAtup        = return NilAtup
-    initCT (SnocAtup t c) = SnocAtup <$> initCT t <*> initC c
-
-    -- get the extent of an embedded array
-    extent :: Shape sh => ExecOpenAcc aenv (Array sh e) -> CIO sh
-    extent ExecAcc{}      = $internalError "executeOpenAcc" "expected delayed array"
-    extent ExecSeq{}      = $internalError "executeOpenAcc" "expected delayed array"
-    extent (EmbedAcc sh)  = executeExp sh aenv stream
-
-
--- Turn a sequence computation into a suspended computation that can be forced
--- an element at a time.
+-- Default sequence evaluation configuration for testing purposes.
 --
-streamSeq :: ExecSeq [a] -> StreamSeq a
-streamSeq (ExecS binds sequ) = StreamSeq $ do
-  aenv <- executeExtend binds Aempty
-  iseq <- initializeSeq aenv sequ
-  let go s = do
-        ms <- stepSeq aenv s
-        case ms of
-          Nothing -> return Nothing
-          Just (s', a) -> return (Just (a, StreamSeq (go s')))
-  go iseq
+defaultSeqConfig :: SeqConfig
+defaultSeqConfig = SeqConfig { chunkSize = case unsafePerformIO (D.queryFlag D.chunk_size) of Nothing -> 128; Just n -> n }
 
 
-stepSeq :: forall a aenv. Aval aenv -> ExecOpenSeq aenv () [a] -> CIO (Maybe (ExecOpenSeq aenv () [a], a))
-stepSeq aenv s = streaming step wait
+-- An executable stream DAG for executing sequence expressions in a
+-- streaming fashion.
+--
+data StreamDAG senv arrs where
+  StreamProducer :: (Shape sh, Elt e) => PrimChunk sh e -> StreamProducer senv (Array sh e) -> StreamDAG (senv, Array sh e) arrs -> StreamDAG senv  arrs
+  StreamConsumer :: Arrays a          =>                   StreamConsumer senv a                                                 -> StreamDAG senv  a
+  StreamReify    :: (Shape sh, Elt e) =>                   Idx senv (Array sh e)                                                 -> StreamDAG senv  [Array sh e]
+
+instance Show (StreamDAG senv arrs) where
+  show s =
+    case s of
+      StreamProducer c p d -> ".. := " ++
+        (case p of
+           StreamStreamIn arrs -> "streamIn " ++ show (length arrs)
+           StreamMap _ -> "streamMap"
+           StreamMapFin n _ -> "streamMapB " ++ show n
+        ) ++ ";\n" ++ show d
+      StreamConsumer c -> show c ++ ";\n"
+
+instance Show (StreamConsumer senv a) where
+  show c = 
+        case c of
+           StreamFold _ _ _ -> "streamFold"
+           StreamStuple NilAtup -> "()"
+           StreamStuple (SnocAtup NilAtup c) -> "(" ++ show c ++ ")"
+           StreamStuple (SnocAtup (SnocAtup NilAtup c1) c0) -> "(" ++ show c0 ++ "," ++ show c1 ++ ")"
+           StreamStuple (SnocAtup (SnocAtup (SnocAtup NilAtup c2) c1) c0) -> "(" ++ show c0 ++ "," ++ show c1 ++ "," ++ show c2 ++ ")"
+           StreamStuple t -> "streamStuple"
+           
+  
+-- An executable producer.
+--
+data StreamProducer senv a where
+  StreamStreamIn :: [Array sh e]
+                 -> StreamProducer senv (Array sh e)
+
+  StreamMap :: (Val' senv -> Int -> Stream -> CIO ())
+            -> StreamProducer senv (Array sh e)
+
+  StreamMapFin :: Int 
+             -> (Val' senv -> Int -> Stream -> CIO ())
+             -> StreamProducer senv (Array sh e)
+
+-- An executable consumer.
+--
+data StreamConsumer senv a where
+
+  -- Stream reduction skeleton.
+  StreamFold :: (Val' senv -> s -> Stream -> CIO s)   -- Chunk consumer function.
+             -> (s -> Stream -> CIO r)                -- Finalizer function.
+             -> s                                     -- Accumulator (internal state).
+             -> StreamConsumer senv r
+
+  StreamStuple :: IsAtuple a
+               => Atuple (StreamConsumer senv) (TupleRepr a)
+               -> StreamConsumer senv a
+
+newtype Id a = Id a
+
+data Shapes senv where
+  EmptyShapes :: Shapes ()
+  PushShape   :: Shapes senv -> sh -> Shapes (senv, Array sh e)
+
+prjShape :: Idx senv (Array sh e) -> Shapes senv -> sh
+prjShape ZeroIdx       (PushShape _   v) = v
+prjShape (SuccIdx idx) (PushShape val _) = prjShape idx val
+prjShape _             _             = $internalError "prj" "inconsistent valuation"
+
+
+-- Initialize the producers and the accumulators of the consumers
+-- with the given array enviroment.
+initialiseSeq :: forall aenv arrs'.
+                 SeqConfig
+              -> ExecOpenSeq Void aenv () arrs'
+              -> Aval aenv
+              -> Stream
+              -> CIO (StreamDAG () arrs', Int)
+initialiseSeq conf topSeq aenv stream = do  
+  s0 <- evalShapes topSeq
+  let pd = maxStepSize (chunkSize conf) s0
+  s1 <- initSeq s0 pd
+  return (s1, pd)
+
   where
-    step :: Stream -> CIO (Maybe (ExecOpenSeq aenv () [a], a))
-    step stream = do
-      ms <- runMaybeT (stepOpenSeq aenv s stream)
-      return $ (,) <$> ms <*> (coll <$> ms)
+    evalClosedExp :: ExecExp () aenv t -> CIO t
+    evalClosedExp exp = executeExp exp aenv stream
 
-    coll :: ExecOpenSeq aenv lenv [a] -> a
-    coll (ExecP _ s') = coll s'
-    coll (ExecC _)    = $internalError "stepSeq" "Unreachable"
-    coll (ExecR _ ma) = case ma of
-                          Nothing -> $internalError "stepSeq" "Trying to collect the value of an unexecuted sequence"
-                          Just a  -> a
-
-stepOpenSeq :: forall aenv arrs'. Aval aenv -> ExecOpenSeq aenv () arrs' -> Stream -> MaybeT CIO (ExecOpenSeq aenv () arrs')
-stepOpenSeq aenv !l stream = go l Empty
-  where
-    go :: forall lenv. ExecOpenSeq aenv lenv arrs' -> Val lenv -> MaybeT CIO (ExecOpenSeq aenv lenv arrs')
-    go s lenv =
+    initSeq :: ExecOpenSeq Id aenv senv a -> Int -> CIO (StreamDAG senv a)
+    initSeq s pd =
       case s of
-        ExecP p s' -> do
-          (p', a) <- produce p
-          s'' <- go s' (lenv `Push` a)
-          return $ ExecP p' s''
-        ExecC c    -> ExecC <$> lift (consume c)
-        ExecR ix _ -> return $ ExecR ix (Just (prj ix lenv))
+        ExecProducer (Id sh) p s' -> do
+          (p', c) <- initProducer pd sh p
+          s'' <- initSeq s' pd
+          return $ StreamProducer c p' s''
+        ExecConsumer   c     -> StreamConsumer <$> initConsumer c pd
+        ExecReify      ix    -> return (StreamReify ix)
+
+    initProducer :: forall sh e senv.
+                    Int
+                 -> sh
+                 -> ExecProducer aenv senv (Array sh e)
+                 -> CIO (StreamProducer senv (Array sh e), PrimChunk sh e)
+    initProducer pd sh p =
+      case p of
+        ExecStreamIn _ arrs -> 
+          do c <- allocateChunk pd sh
+             return $ (StreamStreamIn arrs, c)
+        ExecToSeq kernel gamma _ _ _ n -> 
+          do c <- allocateChunk pd sh
+             return $ (StreamMapFin n $ \ senv i s ->
+                        do -- The events in aenv lives in potentially
+                           -- destroyed streams.
+                           let k = senvSize senv
+--                           ev <- join $ liftIO <$> (Event.waypoint <$> asks activeContext <*> gets eventTable <*> pure s)
+                           execute kernel gamma aenv mempty (Sempty, 1) (k * size sh) (i, asArray (setPD k c)) s
+--                           peekListChunk (setPD k c)
+                       , c)    
+        ExecUseLazy slix _ arr@(Array sh0 _) -> 
+          do c <- allocateChunk pd sh
+             let n = R.size sh0 `div` (size sh `max` 1)
+             return ( StreamMapFin n $ \ senv i s -> 
+                        do let 
+                             k = senvSize senv
+                             args = copyArgs slix sh0 i (i + k)
+                           mapM_ (\ x -> pokeCopyArgs x arr c) args -- FMMA TODO async?
+                           -- FMMA TODO permute
+                    , c)
+        ExecSeqOp kernels gamma sgamma op -> 
+          do c <- allocateChunk pd sh
+             op' <- initSeqOp c kernels gamma sgamma op
+             return (op', c)
+        ExecScanSeq kernels gamma e0
+          | FL () kernel more <- kernels
+          , Cons _ !upsweep1 (Cons _ !upsweep2 _) <- more
+          ->
+          do e0' <- evalClosedExp e0
+             let (_,!numIntervals,_) = configure kernel pd
+             c@(Array _ adata) <- newArray      (Z :. pd + 1) (\ _ -> e0')
+             blk               <- allocateArray (Z :. numIntervals) :: CIO (Vector e)
+             withDevicePtrs adata (Just stream) $ \out -> do
+               let (!body, !sum) = (out, advancePtrsOfArrayData adata pd out)
+                   !d_body = marshalDevicePtrs adata body
+                   !d_sum  = marshalDevicePtrs adata sum
+                   scanner senv _ stream =
+                     do let 
+                          numElements = senvSize senv
+                          (_,!numIntervals,_) = configure kernel numElements
+                        when (numIntervals > 1) $ do
+                          execute upsweep1 gamma aenv mempty senv numElements blk stream
+                          execute upsweep2 gamma aenv mempty senv numIntervals (blk, blk, d_sum) stream
+                        execute kernel gamma aenv mempty senv numElements (numElements, d_body, blk, d_sum) stream
+               return (StreamMap scanner, PrimChunk pd Z adata)
+          | otherwise -> $internalError "initProducer" "scan-seq does not have the required kernels"
+
+    initSeqOp :: forall sh e senv a. (Shape sh, Elt e) 
+              => PrimChunk sh e
+              -> FullList () (AccKernel a)
+              -> Gamma aenv
+              -> Gamma senv
+              -> PreOpenArrayOp (Idx senv) ExecOpenAcc senv aenv (Array sh e)
+              -> CIO (StreamProducer senv (Array sh e))
+    initSeqOp c (FL () kernel more) gamma sgamma op =
+      case op of
+        Map _ x                   -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+        Generate _ _              -> return $ StreamMap $ \ senv _ s -> executeOp senv s
+        Transform _ _ _ x         -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+        Backpermute _ _ x         -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+
+        ZipWith _ x y             -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> after s (prj' y senv) >> executeOp senv s
+        Replicate _ _ x           -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+        Slice _ x _               -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+
+        -- Consumers
+        -- ---------
+        
+        -- Since we always have a streaming dimension, we know that
+        -- (dim sh > 0) and can simplify kernel execution for folds.
+        Fold _ _ x                -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+        Fold1 _ x                 -> return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> executeOp senv s
+        
+        -- FMMA TODO: Segmented folds are currently broken.
+        FoldSeg _ _ x y           -> return $ StreamMap $ \ senv _ s -> foldSegOp c senv x y s -- after s (prj' x senv) >> after s (prj' y senv) >> executeOp senv s
+        Fold1Seg _ x y            -> return $ StreamMap $ \ senv _ s -> foldSegOp c senv x y s -- after s (prj' x senv) >> after s (prj' y senv) >> executeOp senv s
+      {-        Scanl f z x               -> scanlSop (evalClosedFun f) (evalClosedExp z) (prj' x senv) s
+        Scanl1 f x                -> scanl1Sop (evalClosedFun f) (prj' x senv) s
+        Scanr f z x               -> scanrSop (evalClosedFun f) (evalClosedExp z) (prj' x senv) s
+        Scanr1 f x                -> scanr1Sop (evalClosedFun f) (prj' x senv) s -}
+        Permute _ x _ y           -> permuteOp c y x
+-- return $ StreamMap $ \ senv _ s -> after s (prj' x senv) >> after s (prj' y senv) >> permuteOp senv s
+      {-  Stencil sten b x          -> stencilSop (evalClosedFun sten) b (prj' x senv)
+        Stencil2 sten b1 x1 b2 x2 -> stencil2Sop (evalClosedFun sten) b1 b2 (prj' x1 senv) (prj' x2 senv)
+-}
+        op -> $internalError "initSeqOp" ("Operation is not defined yet:" ++ showPreArrOp op)
       where
-        produce :: forall a . ExecP aenv lenv a -> MaybeT CIO (ExecP aenv lenv a, a)
-        produce (ExecToSeq slix acc kernel gamma sls) =
-          do
-             sl : sls' <- return sls
-             lift $ do
-               sh <- extent acc
-               out <- allocateArray (sliceShape slix sh)
-               m <- marshalSlice slix sl
-               execute kernel gamma aenv (size sh) (m, out) stream
-               return (ExecToSeq slix acc kernel gamma sls', out)
-        produce (ExecUseLazy slix arr sls) =
-          do let  sh = shape arr
-             lift $ do
-               sl : sls' <- return sls
-               out <- allocateArray (sliceShape slix sh)
-               useArraySlice slix sl arr out
-               return (ExecUseLazy slix arr sls', out)
-        produce (ExecStreamIn xs) =
-          let use :: ArraysR arrs -> arrs -> CIO ()
-              use ArraysRunit         ()       = return ()
-              use ArraysRarray        arr      = useArrayAsync arr Nothing
-              use (ArraysRpair r1 r2) (a1, a2) = use r1 a1 >> use r2 a2
-          in case xs of
-              []    -> MaybeT (return Nothing)
-              x:xs' -> lift (use (arrays x) (fromArr x)) >> return (ExecStreamIn xs', x)
-        produce (ExecMap afun x) = (ExecMap afun x ,) <$> lift (travAfun1 afun (prj x lenv))
-        produce (ExecZipWith afun x y) = (ExecZipWith afun x y,) <$> lift (travAfun2 afun (prj x lenv) (prj y lenv))
-        produce (ExecScanSeq afun a0 x ma) =
-              do
-                 a <- MaybeT (return ma)
-                 a' <- lift $ travFun2 afun a (prj x lenv ! Z)
-                 return (ExecScanSeq afun a0 x (Just a'), fromList Z [a'])
+        executeOp :: Val' senv -> Stream -> CIO ()
+        executeOp senv stream = do
+          execute kernel gamma aenv sgamma senv (size (chunkEltShape c) * (senvSize senv)) (asArray (setPD (senvSize senv) c)) stream
 
-        consume :: forall a . ExecC aenv lenv a -> CIO (ExecC aenv lenv a)
-        consume c =
-          case c of
-            ExecFoldSeq afun a0 x (Just a) ->
-              do b <- indexArray (prj x lenv) 0
-                 a' <- travFun2 afun a b
-                 return $ ExecFoldSeq afun a0 x (Just a')
-            ExecFoldSeqFlatten afun a0 x (Just a) ->
-              do useArray shapes
-                 a' <- travAfun3 afun a shapes elems
-                 return $ ExecFoldSeqFlatten afun a0 x (Just a')
-                 where
-                   Array sh adata = prj x lenv
-                   elems  = Array ((), R.size sh) adata
-                   shapes = fromList (Z:.1) [toElt sh]
-            ExecStuple t -> ExecStuple <$> consumeT t
-            _            -> $internalError "executeSequence" "Expected already executed consumer"
+        foldSegOp :: forall sh e i. (Shape sh, Elt e, Elt i) => PrimChunk (sh :. Int) e -> Val' senv -> Idx senv (Array (sh :. Int) e) -> Idx senv (Array DIM1 i) -> Stream -> CIO ()
+        foldSegOp c senv x y stream = do
+          -- Marshall the arguments as flattened arrays:
+          a <- asFlat <$> after stream (prj' x senv)
+          s <- asFlat <$> after stream (prj' y senv)
+          let sh :. _ = shape a
+              Z :. sz = shape s
+              c' = asArray' (setPD (senvSize senv) c)
+          error "Sequence-op not implented yet: foldSeg, fold1Seg" -- TODO, scan segments
+          execute kernel gamma aenv mempty (Sempty, 1) (size sh * (sz - 1)) (s, a, 1 :: Int, c') stream
 
-        consumeT :: forall t. Atuple (ExecC aenv lenv) t -> CIO (Atuple (ExecC aenv lenv) t)
-        consumeT NilAtup        = return NilAtup
-        consumeT (SnocAtup t c) = SnocAtup <$> consumeT t <*> consume c
+        permuteOp :: forall sh sh' e. (Shape sh, Shape sh', Elt e) 
+                  => PrimChunk sh' e
+                  -> Idx senv (Array sh e)
+                  -> Idx senv (Array sh' e)
+                  -> CIO (StreamProducer senv (Array sh' e))
+        permuteOp c a d = do
+          let sh' = shape (asArray c)
+              n'  = size sh'
+          PrimChunk _ _ locks <- allocateChunk (chunkLength c) (chunkEltShape c) :: CIO (PrimChunk sh' Int32)
+          withDevicePtrs locks (Just stream) $ \d_locks -> do
+            liftIO $ CUDA.memsetAsync d_locks n' 0 (Just stream)
+            return $ 
+              StreamMap $
+                \ senv _ s -> do
+                  dfs <- after s (prj' d senv)
+                  a <- after s (prj' a senv)
+                  copyArrayAsync (asArray dfs) (asArray (setPD (senvSize senv) c)) (Just s)
+                  execute kernel gamma aenv sgamma senv (senvSize senv * size (chunkEltShape a)) (asArray (setPD (senvSize senv) c), d_locks) s
 
-    travAfun1 :: forall a b. PreOpenAfun ExecOpenAcc aenv (a -> b) -> a -> CIO b
-    travAfun1 (Alam (Abody afun)) a =
-      do nop <- join $ liftIO <$> (Event.create <$> asks activeContext <*> gets eventTable)
-         executeOpenAcc afun (aenv `Apush` (Async nop a)) stream
-    travAfun1 _ _ = error "travAfun1"
+    initConsumer :: forall a senv.
+                    ExecConsumer aenv senv a
+                 -> Int
+                 -> CIO (StreamConsumer senv a)
+    initConsumer c pd =
+      case c of
+        ExecFoldSeq kzip fin gamma (x :: Idx senv (Scalar e)) z ->
+          do z' <- evalSh z
+             c :: PrimChunk Z e <- newChunk pd Z (const z')
+             let consumer :: Val' senv -> PrimChunk Z e -> Stream -> CIO (PrimChunk Z e)
+                 consumer senv c s =
+                   do let c' = setPD (senvSize senv) c
+                      d  <- after s (prj' x senv)
+                      execute kzip gamma aenv mempty (Sempty, 1) (senvSize senv) (asArray c', asArray d) s
+                      return c
+                 finalizer :: PrimChunk Z e -> Stream -> CIO (Scalar e)
+                 finalizer c _ = 
+                   do nop <- join $ liftIO <$> (Event.create <$> asks activeContext <*> gets eventTable)
+                      executeOpenAfun1 fin aenv (Async nop (asArray c))
+             return $ StreamFold consumer finalizer c
+        ExecFoldSeqFlatten f acc x ->
+          do a0 <- executeOpenAcc acc aenv stream
+             let consumer senv a _ =
+                   let c = prj' x senv
+                   in executeOpenAfun2 f aenv (fmap (const a) c) (fmap asArray c)
+             let finalizer x _ = return x
+             return $ StreamFold consumer finalizer a0
+        ExecStuple t ->
+          let initTup :: Atuple (ExecConsumer aenv senv) t -> CIO (Atuple (StreamConsumer senv) t)
+              initTup NilAtup        = return NilAtup
+              initTup (SnocAtup t c) = SnocAtup <$> initTup t <*> initConsumer c pd
+          in StreamStuple <$> initTup t
 
-    travAfun2 :: forall a b c. PreOpenAfun ExecOpenAcc aenv (a -> b -> c) -> a -> b -> CIO c
-    travAfun2 (Alam (Alam (Abody afun))) a b =
-      do nop <- join $ liftIO <$> (Event.create <$> asks activeContext <*> gets eventTable)
-         executeOpenAcc afun (aenv `Apush` (Async nop a) `Apush` (Async nop b)) stream
-    travAfun2 _ _ _ = error "travAfun2"
+    evalSh :: ExecExp () aenv sh -> CIO sh
+    evalSh sh = executeExp sh aenv stream
 
-    travAfun3 :: forall a b c d. PreOpenAfun ExecOpenAcc aenv (a -> b -> c -> d) -> a -> b -> c -> CIO d
-    travAfun3 (Alam (Alam (Alam (Abody afun)))) a b c =
-      do nop <- join $ liftIO <$> (Event.create <$> asks activeContext <*> gets eventTable)
-         executeOpenAcc afun (aenv `Apush` (Async nop a) `Apush` (Async nop b) `Apush` (Async nop c)) stream
-    travAfun3 _ _ _ _ = error "travAfun3"
+    evalShapes :: ExecOpenSeq Void aenv () a -> CIO (ExecOpenSeq Id aenv () a)
+    evalShapes = flip go EmptyShapes
+      where
+        go :: ExecOpenSeq Void aenv senv a -> Shapes senv -> CIO (ExecOpenSeq Id aenv senv a)
+        go (ExecProducer _ (ExecToSeq k gamma slice slix shExp _) s) shs =
+          do sh <- evalSh shExp
+             let sl = sliceShape slice sh
+                 n = size sh `div` (size sl `max` 1)
+             s' <- go s (shs `PushShape` sl)
+             return (ExecProducer (Id sl) (ExecToSeq k gamma slice slix shExp n) s')
+        go (ExecProducer _ p s) shs =
+          do sh <- producerShape p shs
+             s' <- go s (shs `PushShape` sh)
+             return $ ExecProducer (Id sh) p s'
+        go (ExecConsumer c) _ = return $ ExecConsumer c
+        go (ExecReify x)    _ = return $ ExecReify x
 
-    travFun2 :: forall a b c. PreFun ExecOpenAcc aenv (a -> b -> c) -> a -> b -> CIO c
-    travFun2 (Lam (Lam (Body c))) a b = executeOpenExp c (Empty `Push` a `Push` b) aenv stream
-    travFun2 _ _ _ = error "travFun2"
+        producerShape :: Shape sh => ExecProducer aenv senv (Array sh e) -> Shapes senv -> CIO sh
+        producerShape p shs =
+          case p of
+            ExecStreamIn sh _ -> evalSh sh
+            ExecUseLazy slice slix arr -> return $ sliceShape slice (shape arr)
+            ExecSeqOp _ _ _ op -> seqOpShape op shs
+            ExecScanSeq _ _ _ -> return $ Z
+            ExecToSeq{} -> error "Already handled in evalShapes"
 
-        -- get the extent of an embedded array
-    extent :: Shape sh => ExecOpenAcc aenv (Array sh e) -> CIO sh
-    extent ExecAcc{}      = $internalError "executeOpenAcc" "expected delayed array"
-    extent ExecSeq{}      = $internalError "executeOpenAcc" "expected delayed array"
-    extent (EmbedAcc sh)  = executeExp sh aenv stream
+        seqOpShape :: Shape sh => PreOpenArrayOp (Idx senv) ExecOpenAcc senv aenv (Array sh e) -> Shapes senv -> CIO sh
+        seqOpShape op shs =
+          case op of
+            Map _ x                   -> return $ prjShape x shs
+            Generate sh _             -> evalSh sh
+            Transform sh _ _ _        -> evalSh sh
+            Backpermute sh _ _        -> evalSh sh
 
+            ZipWith _ x1 x2           -> return $ prjShape x1 shs `intersect` prjShape x2 shs
+            Replicate slice slix x    -> do sl <- evalSh slix; return $ toElt $ fst $ extend slice (fromElt sl) (fromElt (prjShape x shs))
+            Slice slice x slix        -> do sl <- evalSh slix; return $ toElt $ fst $ restrict slice (fromElt sl) (fromElt (prjShape x shs))
+
+            -- Consumers
+            -- ---------
+            Fold _ _ x                -> return $ let sh :. _ = prjShape x shs in (listToShape . map (max 1) . shapeToList $ sh)
+            Fold1 _ x                 -> return $ let sh :. _ = prjShape x shs in (listToShape . map (max 1) . shapeToList $ sh)
+            FoldSeg _ _ x y           -> return $ let sh :. _ = prjShape x shs in let Z :. sz = prjShape y shs in sh :. sz
+            Fold1Seg _ x y            -> return $ let sh :. _ = prjShape x shs in let Z :. sz = prjShape y shs in sh :. sz
+            Scanl _ _ x               -> return $ let Z :. n = prjShape x shs in Z :. n + 1
+            Scanl1 _ x                -> return $ prjShape x shs
+            Scanr _ _ x               -> return $ let Z :. n = prjShape x shs in Z :. n + 1
+            Scanr1 _ x                -> return $ prjShape x shs
+            Permute _ x1 _ _          -> return $ prjShape x1 shs
+            Stencil _ _ x             -> return $ prjShape x shs
+            Stencil2 _ _ x1 _ x2      -> return $ prjShape x1 shs `intersect` prjShape x2 shs
+
+    maxStepSize :: Int -> ExecOpenSeq Id aenv () a -> Int
+    maxStepSize maxChunkSize s =
+      let elemSize = maxEltSize s
+          (a,b) = maxChunkSize `quotRem` (elemSize `max` 1)
+      in stepSize' (a + signum b) s
+      where
+        maxEltSize :: ExecOpenSeq Id aenv senv a -> Int
+        maxEltSize (ExecProducer (Id sh) _ s0) = size sh `max` maxEltSize s0
+        maxEltSize _ = 0
+
+        stepSize' :: Int -> ExecOpenSeq Id aenv senv a -> Int
+        stepSize' n s =
+          case s of
+            ExecProducer _ p s0 -> min (stepSize' n s0) $
+              case p of
+                ExecStreamIn _ xs -> length (take n xs)
+                ExecToSeq  _ _ _ _ _ k -> n `min` k
+                _ -> n
+            _ -> n
+
+executeSequence :: forall aenv arrs . Arrays arrs
+                => SeqConfig
+                -> ExecOpenSeq Void aenv () arrs
+                -> Aval aenv
+                -> Stream
+                -> CIO arrs
+executeSequence conf s aenv stream
+  = evalSeq'
+  where
+    evalSeq' :: CIO arrs
+    evalSeq' =
+      do (s1, pd) <- initialiseSeq conf s aenv stream
+         loop pd 0 s1
+
+    -- Iterate the given sequence until it terminates.
+    -- A sequence only terminates when one of the producers are exhausted.
+    loop :: Arrays arrs
+         => Int
+         -> Int
+         -> StreamDAG () arrs
+         -> CIO arrs
+    loop n i s =
+      do let k = stepSize n s
+         if k == 0
+           then returnOut s
+           else loop n (i + k) =<< step s i (Sempty, k)
+
+    returnOut :: forall senv. StreamDAG senv arrs -> CIO arrs
+    returnOut s = 
+      case s of
+        StreamProducer c _ s0 -> {- freeArray (asArray c) >> -} returnOut s0
+        StreamReify _ -> error "Absurd"
+        StreamConsumer c -> retC c
+        where 
+          retC :: StreamConsumer senv a -> CIO a
+          retC c =
+            case c of
+              StreamFold _ f x -> streaming (f x) wait
+              StreamStuple t -> 
+                let retT :: forall t. Atuple (StreamConsumer senv) t -> CIO t
+                    retT NilAtup          = return ()
+                    retT (SnocAtup t0 c0) = (,) <$> retT t0 <*> retC c0
+                in toAtuple <$> retT t
+
+    stepSize :: Int -> StreamDAG senv arrs' -> Int
+    stepSize n s =
+      case s of
+        StreamProducer _ p s0 -> min (stepSize n s0) $
+          case p of
+            StreamStreamIn xs -> length (take n xs)
+            StreamMapFin k _ -> n `min` k
+            _ -> n
+        _ -> n
+
+    -- One iteration of a stream.
+    step :: forall senv arrs'.
+            StreamDAG senv arrs'
+         -> Int
+         -> Val' senv
+         -> CIO (StreamDAG senv arrs')
+    step s i senv =
+      case s of
+        StreamProducer c p s' ->
+          do let c' = setPD (senvSize senv) c
+             streaming (produce c' p senv i)
+               $ \ (Async ev p') -> do
+                 s'' <- step s' i (senv `push'` Async ev c')
+                 return (StreamProducer c' p' s'')
+        StreamConsumer c -> StreamConsumer <$> consume c senv
+        StreamReify _ -> $internalError "step" "Absurd"
+
+produce :: forall sh e senv. (Shape sh, Elt e)
+        => PrimChunk sh e
+        -> StreamProducer senv (Array sh e)
+        -> Val' senv
+        -> Int
+        -> Stream
+        -> CIO (StreamProducer senv (Array sh e))
+produce c p senv i stream =
+  case p of
+    StreamStreamIn xs ->
+      do let k           = senvSize senv
+             sh          = chunkEltShape c
+             (xs', xs'') = (take k xs, drop k xs)
+         _ <- mapM (\ (a, i) -> pokeArrayInto a c i) (zip xs' [0..])  -- FMMA TODO async?
+         return (StreamStreamIn xs'')
+    StreamMap f ->
+      do () <- streaming (f senv i) wait
+         return (StreamMap f)
+
+    StreamMapFin n f ->
+      do () <- streaming (f senv i) wait
+         return (StreamMapFin (n - senvSize senv) f)
+
+consume :: forall senv a. StreamConsumer senv a -> Val' senv -> CIO (StreamConsumer senv a)
+consume c senv =
+  case c of
+    StreamFold f g acc ->
+      do acc' <- streaming (f senv acc) wait
+         return (StreamFold f g acc')
+    StreamStuple t ->
+      let consT :: Atuple (StreamConsumer senv) t -> CIO (Atuple (StreamConsumer senv) t)
+          consT NilAtup        = return NilAtup
+          consT (SnocAtup t0 c0) = SnocAtup <$> consT t0 <*> consume c0 senv
+      in StreamStuple <$> consT t
 
 -- Evaluating bindings
 -- -------------------
 
-executeExtend :: Extend ExecOpenAcc aenv aenv' -> Aval aenv -> CIO (Aval aenv')
-executeExtend BaseEnv       aenv = return aenv
-executeExtend (PushEnv e a) aenv = do
-  aenv' <- executeExtend e aenv
-  streaming (executeOpenAcc a aenv') $ \a' -> return $ Apush aenv' a'
-
+executeExtend :: Extend ExecOpenAcc aenv aenv' -> Aval aenv -> (Aval aenv' -> CIO () -> CIO r) -> CIO r
+executeExtend BaseEnv       aenv c = c aenv (return ())
+executeExtend (PushEnv e a) aenv c =
+  executeExtend e aenv (\ aenv' free1 -> streaming' (executeOpenAcc a aenv') $ \a' free2 -> c (aenv' `Apush` a') (free1 >> free2))
 
 -- Scalar expression evaluation
 -- ----------------------------
 
-executeExp :: ExecExp aenv t -> Aval aenv -> Stream -> CIO t
+executeExp :: ExecExp () aenv t -> Aval aenv -> Stream -> CIO t
 executeExp !exp !aenv !stream = executeOpenExp exp Empty aenv stream
 
-executeOpenExp :: forall env aenv exp. ExecOpenExp env aenv exp -> Val env -> Aval aenv -> Stream -> CIO exp
+executeOpenExp :: forall env aenv exp. ExecOpenExp env () aenv exp -> Val env -> Aval aenv -> Stream -> CIO exp
 executeOpenExp !rootExp !env !aenv !stream = travE rootExp
   where
-    travE :: ExecOpenExp env aenv t -> CIO t
+    travE :: ExecOpenExp env () aenv t -> CIO t
     travE exp = case exp of
       Var ix                    -> return (prj ix env)
       Let bnd body              -> travE bnd >>= \x -> executeOpenExp body (env `Push` x) aenv stream
@@ -706,28 +1028,32 @@ executeOpenExp !rootExp !env !aenv !stream = travE rootExp
       Shape acc                 -> shape <$> travA acc
       Index acc ix              -> join $ index      <$> travA acc <*> travE ix
       LinearIndex acc ix        -> join $ indexArray <$> travA acc <*> travE ix
+      ShapeS{}                  -> error "Absurd"
+      IndexS{}                  -> error "Absurd"
+      LinearIndexS{}            -> error "Absurd"
       Foreign _ f x             -> foreign f x
 
     -- Helpers
     -- -------
 
-    travT :: Tuple (ExecOpenExp env aenv) t -> CIO t
+    travT :: Tuple (ExecOpenExp env () aenv) t -> CIO t
     travT tup = case tup of
       NilTup            -> return ()
       SnocTup !t !e     -> (,) <$> travT t <*> travE e
 
     travA :: ExecOpenAcc aenv a -> CIO a
-    travA !acc = executeOpenAcc acc aenv stream
+    travA !acc = do
+      executeOpenAcc acc aenv stream
 
-    foreign :: ExecFun () (a -> b) -> ExecOpenExp env aenv a -> CIO b
+    foreign :: ExecFun () () (a -> b) -> ExecOpenExp env () aenv a -> CIO b
     foreign (Lam (Body f)) x = travE x >>= \e -> executeOpenExp f (Empty `Push` e) Aempty stream
     foreign _              _ = error "I bless the rains down in Africa"
 
-    travF1 :: ExecOpenFun env aenv (a -> b) -> a -> CIO b
+    travF1 :: ExecOpenFun env () aenv (a -> b) -> a -> CIO b
     travF1 (Lam (Body f)) x = executeOpenExp f (env `Push` x) aenv stream
     travF1 _              _ = error "Gonna take some time to do the things we never have"
 
-    while :: ExecOpenFun env aenv (a -> Bool) -> ExecOpenFun env aenv (a -> a) -> a -> CIO a
+    while :: ExecOpenFun env () aenv (a -> Bool) -> ExecOpenFun env () aenv (a -> a) -> a -> CIO a
     while !p !f !x = do
       ok <- travF1 p x
       if ok then while p f =<< travF1 f x
@@ -760,6 +1086,29 @@ executeOpenExp !rootExp !env !aenv !stream = travE rootExp
     index :: (Shape sh, Elt e) => Array sh e -> sh -> CIO e
     index !arr !ix = indexArray arr (toIndex (shape arr) ix)
 
+extend :: SliceIndex slix sl co dim
+       -> slix
+       -> sl
+       -> (dim, dim -> sl)
+extend SliceNil              ()        ()       = ((), const ())
+extend (SliceAll sliceIdx)   (slx, ()) (sl, sz)
+  = let (dim', f') = extend sliceIdx slx sl
+    in  ((dim', sz), \(ix, i) -> (f' ix, i))
+extend (SliceFixed sliceIdx) (slx, sz) sl
+  = let (dim', f') = extend sliceIdx slx sl
+    in  ((dim', sz), \(ix, _) -> f' ix)
+
+restrict :: SliceIndex slix sl co sh
+         -> slix
+         -> sh
+         -> (sl, sl -> sh)
+restrict SliceNil              ()        ()       = ((), const ())
+restrict (SliceAll sliceIdx)   (slx, ()) (sl, sz)
+  = let (sl', f') = restrict sliceIdx slx sl
+    in  ((sl', sz), \(ix, i) -> (f' ix, i))
+restrict (SliceFixed sliceIdx) (slx, i)  (sl, sz)
+  = let (sl', f') = restrict sliceIdx slx sl
+    in  $indexCheck "slice" i sz $ (sl', \ix -> (f' ix, i))
 
 -- Marshalling data
 -- ----------------
@@ -814,7 +1163,6 @@ instance (Marshalable a, Marshalable b, Marshalable c, Marshalable d)
   marshal (!a, !b, !c, !d) ms
     = concat <$> sequence [marshal a ms, marshal b ms, marshal c ms, marshal d ms]
 
-
 #define primMarshalable(ty)                                                    \
 instance Marshalable (ty) where {                                              \
   marshal !x _ = return [CUDA.VArg x] }
@@ -851,8 +1199,8 @@ primMarshalable(CUDA.DevicePtr a)
 -- as to use the larger available caches.
 --
 
-marshalAccEnvTex :: AccKernel a -> Aval aenv -> Gamma aenv -> Stream -> ContT b CIO [CUDA.FunParam]
-marshalAccEnvTex !kernel !aenv (Gamma !gamma) !stream
+marshalAccEnvTex :: AccKernel a -> Aval aenv -> Gamma aenv -> Val' senv -> Gamma senv -> Stream -> ContT b CIO [CUDA.FunParam]
+marshalAccEnvTex !kernel !aenv (Gamma !gamma) !senv (Gamma !sgamma) !stream
   = flip concatMapM (Map.toList gamma)
   $ \(Idx_ !(idx :: Idx aenv (Array sh e)), i) ->
         do arr <- after stream (aprj idx aenv)
@@ -865,10 +1213,12 @@ marshalAccTex (_, !arrIn) (AccKernel _ _ !lmdl _ _ _ _) (Array !sh !adata) ms ru
       texs <- liftIO $ withLifetime lmdl $ \mdl -> (sequence' $ map (CUDA.getTex mdl) (reverse arrIn))
       marshalTextureData adata (R.size sh) texs ms (const run)
 
-marshalAccEnvArg :: Aval aenv -> Gamma aenv -> Stream -> ContT b CIO [CUDA.FunParam]
-marshalAccEnvArg !aenv (Gamma !gamma) !stream
-  = concatMapM (\(Idx_ !idx) -> flip marshal (Just stream) =<< after stream (aprj idx aenv)) (Map.keys gamma)
-
+marshalAccEnvArg :: Aval aenv -> Gamma aenv -> Val' senv -> Gamma senv -> Stream -> ContT b CIO [CUDA.FunParam]
+marshalAccEnvArg !aenv (Gamma !gamma) (!senv, k) (Gamma !sgamma) !stream
+  = do xs <- concatMapM (\(Idx_ !idx) -> flip marshal (Just stream) =<< after stream (aprj idx aenv)) (Map.keys gamma)
+       ys <- concatMapM (\(Idx_ !idx) -> flip marshal (Just stream) . asArray' =<< after stream (sprj idx senv)) (Map.keys sgamma)
+       k' <- marshal k (Just stream)
+       return $ xs ++ ys ++ concat [k' | Map.size sgamma > 0] -- Only marshal the chunk size if there are any chunks..
 
 -- A lazier version of 'Control.Monad.sequence'
 --
@@ -880,7 +1230,6 @@ sequence' = foldr k (return [])
 --
 concatMapM :: Monad m => (a -> m [b]) -> [a] -> m [b]
 concatMapM f xs = concat `liftM` mapM f xs
-
 
 -- Kernel execution
 -- ----------------
@@ -900,15 +1249,17 @@ arguments :: Marshalable args
           => AccKernel a
           -> Aval aenv
           -> Gamma aenv
+          -> Val' senv
+          -> Gamma senv
           -> args
           -> Stream
           -> ContT b CIO [CUDA.FunParam]
-arguments !kernel !aenv !gamma !a !stream = do
+arguments !kernel !aenv !gamma !senv !sgamma !a !stream = do
   dev <- asks deviceProperties
   let marshaller | computeCapability dev < Compute 2 0   = marshalAccEnvTex kernel
                  | otherwise                             = marshalAccEnvArg
   --
-  (++) <$> marshaller aenv gamma stream <*> marshal a (Just stream)
+  (++) <$> marshaller aenv gamma senv sgamma stream <*> marshal a (Just stream)
 
 
 -- Link the binary object implementing the computation, configure the kernel
@@ -919,12 +1270,14 @@ execute :: Marshalable args
         => AccKernel a                  -- The binary module implementing this kernel
         -> Gamma aenv                   -- variables of arrays embedded in scalar expressions
         -> Aval aenv                    -- the environment
+        -> Gamma senv                   -- variables of arrays embedded in scalar expressions
+        -> Val' senv                    -- the environment
         -> Int                          -- a "size" parameter, typically number of elements in the output
         -> args                         -- arguments to marshal to the kernel function
         -> Stream                       -- Compute stream to execute in
         -> CIO ()
-execute !kernel !gamma !aenv !n !a !stream = evalContT $ do
-  args  <- arguments kernel aenv gamma a stream
+execute !kernel !gamma !aenv !sgamma !senv !n !a !stream = evalContT $ do
+  args  <- arguments kernel aenv gamma senv sgamma a stream
   liftIO $ launch kernel (configure kernel n) args stream
 
 
@@ -939,4 +1292,90 @@ launch (AccKernel entry !fn _ _ _ _ _) !(cta, grid, smem) !args !stream
     msg gpuTime cpuTime
       = "exec: " ++ entry ++ "<<< " ++ shows grid ", " ++ shows cta ", " ++ shows smem " >>> "
                  ++ D.elapsed gpuTime cpuTime
+
+
+streamSeq :: Arrays a => ExecSeq [a] -> CIO (LazySeq a)
+streamSeq (ExecS !ext !s) = streaming go wait
+  where
+    go !stream = do
+      executeExtend ext Aempty
+        (\ aenv freeStreams -> 
+          streamOutSeq defaultSeqConfig s aenv freeStreams stream)
+
+streamOutSeq :: forall aenv arrs . Arrays arrs
+             => SeqConfig
+             -> ExecOpenSeq Void aenv () [arrs]
+             -> Aval aenv
+             -> CIO () -- Stream destroyer for the streams producing aenv.
+             -> Stream
+             -> CIO (LazySeq arrs)
+streamOutSeq conf s aenv freeStreams stream
+  = evalSeq'
+  where
+    evalSeq' :: CIO (LazySeq arrs)
+    evalSeq' =
+      do (s1, pd) <- initialiseSeq conf s aenv stream
+         loop pd s1 0
+
+    -- Iterate the given sequence until it terminates.
+    -- A sequence only terminates when one of the producers are exhausted.
+    loop :: Arrays arrs
+         => Int
+         -> StreamDAG () [arrs]
+         -> Int
+         -> CIO (LazySeq arrs)
+    loop n s i =
+      do let k = stepSize n s
+         if k == 0
+           then do
+             free s
+             freeStreams -- Release the streams for aenv. FMMA TODO maybe free aenv explicitely as well?
+             return Done
+           else do     
+             (as, s') <- step s (Sempty, k) i
+             return $ Yield as (loop n s' (i + k))
+
+    stepSize :: Int -> StreamDAG senv arrs' -> Int
+    stepSize n s =
+      case s of
+        StreamProducer _ p s0 -> min (stepSize n s0) $
+          case p of
+            StreamStreamIn xs -> length (take n xs)
+            StreamMapFin k _ -> n `min` k
+            _ -> n
+        _ -> n
+
+    free :: forall senv arrs'. StreamDAG senv arrs'
+         -> CIO ()
+    free s =
+      case s of
+        StreamProducer c _ s0 -> {- freeArray (asArray c) >> -} free s0
+        StreamReify _ -> return ()
+        StreamConsumer _ -> error "Absurd"
+
+    -- One iteration of a stream.
+    step :: forall senv arrs'.
+            StreamDAG senv arrs'
+         -> Val' senv
+         -> Int
+         -> CIO (arrs', StreamDAG senv arrs')
+    step s senv i =
+      case s of
+        StreamProducer c p s' ->
+          do let c' = setPD (senvSize senv) c
+             streaming (produce c' p senv i)
+               $ \ (Async ev p') -> do
+                 (x, s'') <- step s' (senv `push'` Async ev c') i
+                 return (x, StreamProducer c' p' s'')
+        StreamReify x -> 
+          do as <- peekArraysOfChunk =<< wait (prj' x senv) -- FMMA TODO async?
+             return (as, StreamReify x)
+        StreamConsumer c -> error "Absurd"
+
+
+-- FMMA TODO Use generate or memset instead, move to sugar
+newChunk :: (Shape sh, Elt e) => Int -> sh -> (sh -> e) -> CIO (PrimChunk sh e)
+newChunk pd sh f = 
+  do Array _ adata <- newArray (pd .: sh) (f . indexInit)
+     return (PrimChunk pd sh adata)
 

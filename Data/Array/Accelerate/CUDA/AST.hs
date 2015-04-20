@@ -1,7 +1,11 @@
+{-# LANGUAGE EmptyDataDecls             #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GADTs                      #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE KindSignatures             #-}
+{-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE TypeOperators              #-}
 {-# LANGUAGE TypeSynonymInstances       #-}
 -- |
 -- Module      : Data.Array.Accelerate.CUDA.AST
@@ -21,16 +25,18 @@ module Data.Array.Accelerate.CUDA.AST (
   AccKernel(..), Free, Gamma(..), Idx_(..),
   ExecAcc, ExecAfun, ExecOpenAfun, ExecOpenAcc(..),
   ExecExp, ExecFun, ExecOpenExp, ExecOpenFun,
-  ExecSeq(..), ExecOpenSeq(..), ExecP(..), ExecC(..),
+  ExecSeq(..), ExecOpenSeq(..), ExecProducer(..), ExecConsumer(..),
   freevar, makeEnvMap,
+  Chunk, Void(..),
 
 ) where
 
+import Data.Array.Accelerate.CUDA.Array.Prim (DevicePtrs)
 -- friends
 import Data.Array.Accelerate.AST
 import Data.Array.Accelerate.Lifetime
 import Data.Array.Accelerate.Pretty
-import Data.Array.Accelerate.Array.Sugar                ( Array, Shape, Elt, Arrays, Vector, EltRepr, Atuple, TupleRepr, IsAtuple, Scalar )
+import Data.Array.Accelerate.Array.Sugar                ( Array, Shape, Elt, Arrays, Atuple, TupleRepr, IsAtuple, Vector, Scalar, (:.), EltRepr )
 import Data.Array.Accelerate.Array.Representation       ( SliceIndex(..) )
 import Data.Array.Accelerate.Trafo                      ( Extend )
 import qualified Data.Array.Accelerate.FullList         as FL
@@ -112,6 +118,7 @@ instance Hashable (Idx_ aenv) where
   hashWithSalt salt (Idx_ ix)
     = salt `hashWithSalt` idxToInt ix
 
+data Void a = Void
 
 -- Interleave compilation & execution state annotations into an open array
 -- computation AST
@@ -123,13 +130,12 @@ data ExecOpenAcc aenv a where
             -> ExecOpenAcc aenv a                               -- the recursive knot
 
   EmbedAcc  :: (Shape sh, Elt e)
-            => !(PreExp ExecOpenAcc aenv sh)                    -- shape of the result array, used by execution
+            => !(PreExp ExecOpenAcc () aenv sh)                 -- shape of the result array, used by execution
             -> ExecOpenAcc aenv (Array sh e)
 
-  ExecSeq :: Arrays arrs
-           => ExecOpenSeq aenv () arrs
-           -> ExecOpenAcc aenv arrs
-
+  ExecSeq   :: Arrays arrs
+            => ExecOpenSeq Void aenv () arrs
+            -> ExecOpenAcc aenv arrs
 
 -- An annotated AST suitable for execution in the CUDA environment
 --
@@ -181,73 +187,120 @@ prettyExecAcc alvl wrap exec =
     ExecSeq _ -> text "<SequenceComputation>"
 
 data ExecSeq a where
-  ExecS :: Extend ExecOpenAcc () aenv -> ExecOpenSeq aenv () a -> ExecSeq a
+  ExecS :: Extend ExecOpenAcc () aenv -> ExecOpenSeq Void aenv () a -> ExecSeq a
 
-data ExecOpenSeq aenv lenv arrs where
-  ExecP :: Arrays a   => ExecP aenv lenv a -> ExecOpenSeq aenv (lenv, a) arrs -> ExecOpenSeq aenv lenv  arrs
-  ExecC :: (Arrays a) => ExecC aenv lenv a ->                                ExecOpenSeq aenv lenv a
-  ExecR ::                      Idx lenv a -> Maybe a ->                     ExecOpenSeq aenv lenv [a]
+type Chunk sh e = Array (sh :. Int) e
 
-data ExecP aenv lenv a where
+data ExecOpenSeq shape aenv senv arrs where
+  ExecProducer :: (Shape sh, Elt e)
+           => shape sh
+           -> ExecProducer aenv senv (Array sh e)
+           -> ExecOpenSeq shape aenv (senv, Array sh e) arrs
+           -> ExecOpenSeq shape aenv senv arrs
 
-  ExecToSeq    :: (Elt slix, Shape sl, Shape sh, Elt e)
-               => SliceIndex (EltRepr slix)
-                             (EltRepr sl)
-                             co
-                             (EltRepr sh)
-               -> ExecOpenAcc aenv (Array sh e)
-               -> AccKernel (Array sl e)
-               -> !(Gamma aenv)
-               -> [slix]
-               -> ExecP aenv lenv (Array sl e)
+  ExecConsumer :: Arrays arrs
+           => ExecConsumer aenv senv arrs
+           -> ExecOpenSeq shape aenv senv arrs
 
+  ExecReify :: (Shape sh, Elt e)
+            => Idx senv (Array sh e)
+            -> ExecOpenSeq shape aenv senv [Array sh e]
+
+data ExecProducer aenv senv a where
+  -- Convert the given Haskell-list of arrays to a sequence.
+  ExecStreamIn :: (Shape sh, Elt e)
+               => ExecExp () aenv sh
+               -> [Array sh e]
+               -> ExecProducer aenv senv (Array sh e)
+
+  -- Convert the given array to a sequence.
+  ExecToSeq :: (Elt slix, Shape sl, Shape sh, Elt e)
+            => !(AccKernel (Chunk sl e))
+            -> !(Gamma aenv)
+            -> !( SliceIndex  (EltRepr slix)
+                              (EltRepr sl)
+                              co
+                              (EltRepr sh))
+            -> !(proxy slix)
+            -> !(PreExp ExecOpenAcc () aenv sh)   
+            -> Int -- N slices
+            -> ExecProducer aenv senv (Array sl e)
+
+  -- Convert the given array to a sequence.
   ExecUseLazy :: (Elt slix, Shape sl, Shape sh, Elt e)
-              => SliceIndex (EltRepr slix)
-                            (EltRepr sl)
-                            co
-                            (EltRepr sh)
+              => !( SliceIndex  (EltRepr slix)
+                                (EltRepr sl)
+                                co
+                                (EltRepr sh))
+              -> !(proxy slix)
               -> Array sh e
-              -> [slix]
-              -> ExecP aenv lenv (Array sl e)
+              -> ExecProducer aenv senv (Array sl e)
 
-  ExecStreamIn :: Arrays a
-               => [a]
-               -> ExecP aenv lenv a
+  -- Map a basic array operation over a sequence.
+  ExecSeqOp :: (Shape sh, Elt e)
+            => {-# UNPACK #-} !(FL.FullList () (AccKernel (Chunk sh e)))
+            -> !(Gamma aenv)
+            -> !(Gamma senv)
+            -> !(PreOpenArrayOp (Idx senv) ExecOpenAcc senv aenv (Array sh e))
+            -> ExecProducer aenv senv (Array sh e)
 
-  ExecMap :: (Arrays a, Arrays b)
-          => ExecOpenAfun aenv (a -> b)
-          -> Idx lenv a
-          -> ExecP aenv lenv b
+  -- ScanSeq (+) a0 x. Scan a sequence x by combining each element
+  -- using the given binary operation (+). (+) must be associative:
+  --
+  --   Forall a b c. (a + b) + c = a + (b + c),
+  --
+  -- and a0 must be the identity element for (+):
+  --
+  --   Forall a. a0 + a = a = a + a0.
+  --
+  ExecScanSeq :: Elt e
+              => {-# UNPACK #-} !(FL.FullList () (AccKernel (Vector e)))
+              -> !(Gamma aenv)
+              -> ExecExp () aenv e
+              -> ExecProducer aenv senv (Scalar e)
 
-  ExecZipWith :: (Arrays a, Arrays b, Arrays c)
-              => ExecOpenAfun aenv (a -> b -> c)
-              -> Idx lenv a
-              -> Idx lenv b
-              -> ExecP aenv lenv c
+data ExecConsumer aenv senv a where
 
-  ExecScanSeq :: Elt a
-              => ExecFun aenv (a -> a -> a)
-              -> ExecExp aenv a
-              -> Idx lenv (Scalar a)
-              -> Maybe a
-              -> ExecP aenv lenv (Scalar a)
+  -- FoldSeq (+) a0 x. Fold a sequence x by combining each element
+  -- using the given binary operation (+). (+) must be associative:
+  --
+  --   Forall a b c. (a + b) + c = a + (b + c),
+  --
+  -- and a0 must be the identity element for (+):
+  --
+  --   Forall a. a0 + a = a = a + a0.
+  --
+  ExecFoldSeq :: Elt e
+              => {-# UNPACK #-} !(AccKernel (Vector e)) -- Zipping kernel
+              -> ExecOpenAfun aenv (Vector e -> Scalar e)
+              -> !(Gamma aenv)
+              -> !(Idx senv (Scalar e))
+              -> ExecExp () aenv e
+              -> ExecConsumer aenv senv (Scalar e)
 
-data ExecC aenv lenv a where
-  ExecFoldSeq :: Elt a
-              => ExecFun aenv (a -> a -> a)
-              -> ExecExp aenv a
-              -> Idx lenv (Scalar a)
-              -> Maybe a
-              -> ExecC aenv lenv (Scalar a)
-
+  -- FoldSeqFlatten f a0 x. A specialized version of FoldSeqAct where
+  -- reduction with the companion operator corresponds to
+  -- flattening. f must be semi-associative, with vecotor append (++)
+  -- as the companion operator:
+  --
+  --   Forall b sh1 a1 sh2 a2.
+--       f (f b sh1 a1) sh2 a2 = f b (sh1 ++ sh2) (a1 ++ a2).
+  --
+  -- It is common to ignore the shape vectors, yielding the usual
+  -- semi-associativity law:
+  --
+  --   f b a _ = b + a,
+  --
+  -- for some (+) satisfying:
+  --
+  --   Forall b a1 a2. (b + a1) + a2 = b + (a1 ++ a2).
+  --
   ExecFoldSeqFlatten :: (Arrays a, Shape sh, Elt e)
-                     => ExecOpenAfun aenv (a -> Vector sh -> Vector e -> a)
-                     -> ExecOpenAcc aenv a
-                     -> Idx lenv (Array sh e)
-                     -> Maybe a
-                     -> ExecC aenv lenv a
+                     => !(ExecOpenAfun aenv (a -> Array (sh :. Int) e -> a))
+                     -> !(ExecOpenAcc aenv a)
+                     -> !(Idx senv (Array sh e))
+                     -> ExecConsumer aenv senv a
 
   ExecStuple :: (Arrays a, IsAtuple a)
-             => Atuple (ExecC aenv senv) (TupleRepr a)
-             -> ExecC aenv senv a
-
+             => !(Atuple (ExecConsumer aenv senv) (TupleRepr a))
+             -> ExecConsumer aenv senv a

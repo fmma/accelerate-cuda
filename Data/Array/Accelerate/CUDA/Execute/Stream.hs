@@ -15,7 +15,7 @@
 
 module Data.Array.Accelerate.CUDA.Execute.Stream (
 
-  Stream, Reservoir, new, streaming,
+  Stream, Reservoir, new, streaming, streaming',
 
 ) where
 
@@ -71,6 +71,19 @@ streaming !ctx !rsv@(Reservoir !_ !weak_rsv) !etbl !action !after = do
   final  <- after end first
   liftIO $! destroy (weakContext ctx) weak_rsv stream
   liftIO $! Event.destroy end
+  return final
+
+-- TODO maybe find a better way to keep streams alive
+{-# INLINE streaming' #-}
+streaming' :: MonadIO m => Context -> Reservoir -> EventTable -> (Stream -> m a) -> (Event -> a -> m () -> m b) -> m b
+streaming' !ctx !rsv@(Reservoir !_ !weak_rsv) !etbl !action !after = do
+  stream <- liftIO $ create ctx rsv
+  first  <- action stream
+  end    <- liftIO $ Event.waypoint ctx etbl stream
+  let free = do
+        liftIO $! destroy (weakContext ctx) weak_rsv stream
+        liftIO $! Event.destroy end
+  final  <- after end first free
   return final
 
 

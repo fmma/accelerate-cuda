@@ -2,6 +2,7 @@
 {-# LANGUAGE ConstraintKinds     #-}
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE GADTs               #-}
+{-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
 {-# LANGUAGE TupleSections       #-}
@@ -22,12 +23,16 @@ module Data.Array.Accelerate.CUDA.Array.Prim (
   DevicePtrs, HostPtrs,
 
   mallocArray, indexArray,
-  useArray,  useArrayAsync, useArraySlice, useDevicePtrs,
+  useArray,  useArrayAsync, useDevicePtrs,
   copyArray, copyArrayAsync, copyArrayPeer, copyArrayPeerAsync,
   peekArray, peekArrayAsync,
   pokeArray, pokeArrayAsync,
+  pokeArrayInto, peekArrayFrom, pokeCopyArgs,
+  pokeArrayIntoAsync, peekArrayFromAsync, pokeCopyArgsAsync,
   marshalDevicePtrs, marshalArrayData, marshalTextureData,
-  withDevicePtrs, advancePtrsOfArrayData
+  withDevicePtrs, advancePtrsOfArrayData,
+  
+  peekListChunk,
 
 ) where
 
@@ -52,9 +57,10 @@ import qualified Foreign.CUDA.Driver.Texture            as CUDA
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Lifetime                   ( withLifetime )
 import Data.Array.Accelerate.Array.Data
+import Data.Array.Accelerate.Array.Sugar                ( size, EltRepr )
 import Data.Array.Accelerate.Array.Memory               ( PrimElt )
 import Data.Array.Accelerate.CUDA.Context
-import Data.Array.Accelerate.CUDA.Array.Slice           ( TransferDesc(..), blocksOf )
+import Data.Array.Accelerate.CUDA.Array.Slice
 import Data.Array.Accelerate.CUDA.Array.Cache
 import qualified Data.Array.Accelerate.CUDA.Debug       as D
 
@@ -192,30 +198,6 @@ useArray !ctx !mt !ad !n0 =
     alloc <- malloc ctx mt ad True n
     when alloc $ withDevicePtrs ctx mt ad Nothing run
 
--- A combination of 'mallocArray' and 'pokeArray' to allocate space on the
--- device and upload an existing array. This is specialised because if the host
--- array is shared on the heap, we do not need to do anything.
---
-useArraySlice
-    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable e, Typeable a, Storable a)
-    => Context
-    -> MemoryTable
-    -> ArrayData e
-    -> ArrayData e
-    -> TransferDesc
-    -> IO ()
-useArraySlice !ctx !mt !ad_host !ad_dev !tdesc =
-  let src    = ptrsOfArrayData ad_host
-      k      = sizeOf (undefined :: a)
-      run dst =
-        sequence_
-          [ transfer "useArraySlice/malloc" (k * size) $ CUDA.pokeArray size (plusPtr src (k * src_offset)) (plusDevPtr dst (k * dst_offset))
-          | (src_offset, dst_offset, size) <- blocksOf tdesc]
-  in do
-    alloc <- malloc ctx mt ad_dev True (k * nblocks tdesc * blocksize tdesc)
-    when alloc $ withDevicePtrs ctx mt ad_dev Nothing run
-
-
 useArrayAsync
     :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable e, Typeable a, Storable a)
     => Context
@@ -350,6 +332,13 @@ peekArray !ctx !mt !ad !n =
     transfer "peekArray" (n * sizeOf (undefined :: a)) $
       CUDA.peekArray n src (ptrsOfArrayData ad)
 
+-- Copy data from the device into the associated Accelerate host-side array
+--
+-- TODO type sig.
+peekListChunk !ctx !mt !n !ad =
+  withDevicePtrs ctx mt ad Nothing $ \src ->
+    CUDA.peekListArray n src >>= print
+
 peekArrayAsync
     :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
     => Context
@@ -377,6 +366,151 @@ pokeArray !ctx !mt !ad !n =
   withDevicePtrs ctx mt ad Nothing $ \dst ->
     transfer "pokeArray: " (n * sizeOf (undefined :: a)) $
       CUDA.pokeArray n (ptrsOfArrayData ad) dst
+
+pokeMemcpy2D
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable e, Typeable a, Storable a)
+    => Context
+    -> MemoryTable
+    -> Memcpy2Dargs
+    -> ArrayData e
+    -> ArrayData e
+    -> IO ()
+pokeMemcpy2D !ctx !mt Memcpy2Dargs{..}  !ad_host !ad_dev =
+  withDevicePtrs ctx mt ad_dev Nothing $ \dst ->
+      transfer "pokeMemcpy2D: " (width * height * sizeOf (undefined :: a)) $
+        CUDA.pokeArray2D 
+          width
+          height
+          (ptrsOfArrayData ad_host)
+          srcPitch
+          srcX
+          srcY
+          dst
+          dstPitch
+          dstX
+          dstY
+
+pokeCopyArgs
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable e, Typeable a, Storable a)
+    => Context
+    -> MemoryTable
+    -> CopyArgs
+    -> ArrayData e
+    -> ArrayData e
+    -> IO ()
+pokeCopyArgs !ctx !mt CopyArgs{..}  !ad_host !ad_dev =
+  withDevicePtrs ctx mt ad_dev Nothing $ \dst ->
+    mapM_ 
+      (\ Memcpy2Dargs{..} ->
+        transfer "pokeCopyArgs: " (width * height * sizeOf (undefined :: a)) $
+          CUDA.pokeArray2D 
+            width
+            height
+            (ptrsOfArrayData ad_host)
+            srcPitch
+            srcX
+            srcY
+            (advancePtrsOfArrayData offset ad_dev dst)
+            dstPitch
+            dstX
+            dstY
+      ) memcpy2Dargs
+
+pokeCopyArgsAsync
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable e, Typeable a, Storable a)
+    => Context
+    -> MemoryTable
+    -> CopyArgs
+    -> ArrayData e
+    -> ArrayData e
+    -> Maybe CUDA.Stream
+    -> IO ()
+pokeCopyArgsAsync !ctx !mt CopyArgs{..}  !ad_host !ad_dev !st =
+  withDevicePtrs ctx mt ad_dev st $ \dst ->
+    mapM_ 
+      (\ Memcpy2Dargs{..} ->
+        transfer "pokeCopyArgsAsync: " (width * height * sizeOf (undefined :: a)) $
+          CUDA.pokeArray2DAsync
+            width
+            height
+            (CUDA.HostPtr (ptrsOfArrayData ad_host))
+            srcPitch
+            srcX
+            srcY
+            (advancePtrsOfArrayData offset ad_dev dst)
+            dstPitch
+            dstX
+            dstY
+            st
+      ) memcpy2Dargs
+
+
+-- Copy data from an Accelerate array into the associated device array (of a different array!)
+--
+pokeArrayInto
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
+    => Context
+    -> MemoryTable
+    -> ArrayData e -- src (host)
+    -> ArrayData e -- dst (device)
+    -> Int
+    -> Int -- offset into dst
+    -> IO ()
+pokeArrayInto !ctx !mt !ad !ad' !n !offset =
+  withDevicePtrs ctx mt ad' Nothing $ \dst ->
+    transfer "pokeArrayInto: " (n * sizeOf (undefined :: a)) $
+      CUDA.pokeArray n (ptrsOfArrayData ad) (advancePtrsOfArrayData offset ad' dst)
+
+-- Copy data from an Accelerate array into the associated device array (of a different array!)
+--
+pokeArrayIntoAsync
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
+    => Context
+    -> MemoryTable
+    -> ArrayData e -- src (host)
+    -> ArrayData e -- dst (device)
+    -> Int
+    -> Int -- offset into dst
+    -> Maybe CUDA.Stream
+    -> IO ()
+pokeArrayIntoAsync !ctx !mt !ad !ad' !n !offset !st =
+  withDevicePtrs ctx mt ad' st $ \dst ->
+    transfer "pokeArrayIntoAsync: " (n * sizeOf (undefined :: a)) $
+      CUDA.pokeArrayAsync n (CUDA.HostPtr (ptrsOfArrayData ad)) (advancePtrsOfArrayData offset ad' dst) st
+      
+-- Copy data from an Accelerate array into the associated device array (of a different array!)
+--
+peekArrayFrom
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
+    => Context
+    -> MemoryTable
+    -> ArrayData e -- src (device)
+    -> ArrayData e -- dst (host)
+    -> Int
+    -> Int -- offset into dst
+    -> IO ()
+peekArrayFrom !ctx !mt !ad !ad' !n !offset =
+  withDevicePtrs ctx mt ad Nothing $ \src ->
+    transfer "peekArrayFrom: " (n * sizeOf (undefined :: a)) $
+      CUDA.peekArray n (advancePtrsOfArrayData offset ad src) (ptrsOfArrayData ad')
+
+
+-- Copy data from an Accelerate array into the associated device array (of a different array!)
+--
+peekArrayFromAsync
+    :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
+    => Context
+    -> MemoryTable
+    -> ArrayData e -- src (device)
+    -> ArrayData e -- dst (host)
+    -> Int
+    -> Int -- offset into dst
+    -> Maybe CUDA.Stream
+    -> IO ()
+peekArrayFromAsync !ctx !mt !ad !ad' !n !offset !st =
+  withDevicePtrs ctx mt ad st $ \src ->
+    transfer "peekArrayFrom: " (n * sizeOf (undefined :: a)) $
+      CUDA.peekArrayAsync n (advancePtrsOfArrayData offset ad src) (CUDA.HostPtr (ptrsOfArrayData ad')) st
 
 pokeArrayAsync
     :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
@@ -493,4 +627,3 @@ transfer name bytes action
                                      ++ D.elapsed gpuTime cpuTime
     in
     D.timed D.dump_gc msg Nothing action
-

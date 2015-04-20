@@ -23,16 +23,18 @@ module Data.Array.Accelerate.CUDA.CodeGen.Base (
   -- Names and Types
   CUTranslSkel(..), CUDelayedAcc(..), CUExp(..), CUFun1(..), CUFun2(..),
   Eliminate, Instantiate1, Instantiate2,
-  Name, namesOfArray, namesOfAvar, groupOfInt,
+  Name, namesOfArray, namesOfAvar, namesOfSvar, groupOfInt,
 
   -- Declaration generation
   cint, cvar, ccall, cchar, cintegral, cbool, cshape, cslice, csize, cindexHead, cindexTail, ctoIndex, cfromIndex,
   readArray, writeArray, shared,
-  indexArray, environment, arrayAsTex, arrayAsArg,
+  indexArray, environment, environmentS, arrayAsTex, arrayAsArg,
   umul24, gridSize, threadIdx,
+  
+  cchunkIndex,
 
   -- Mutable operations
-  (.=.), locals, Lvalue(..), Rvalue(..),
+  (.=.), locals, localsShapeFromDim, Lvalue(..), Rvalue(..),
 
 ) where
 
@@ -73,6 +75,17 @@ namesOfArray grp _
     in
     ( "sh" ++ grp, map arr [n-1, n-2 .. 0] )
 
+namesOfChunk
+    :: forall e. Elt e
+    => Name             -- name of group: typically "Out" or "InX" for some number 'X'
+    -> e                -- dummy
+    -> (Name, [Name])   -- shape and array field names
+namesOfChunk grp _
+  = let ty      = eltType (undefined :: e)
+        arr x   = "chunk" ++ grp ++ '_':show x
+        n       = length ty
+    in
+    ( "csh" ++ grp, map arr [n-1, n-2 .. 0] )
 
 namesOfAvar :: forall aenv sh e. (Shape sh, Elt e) => Gamma aenv -> Idx aenv (Array sh e) -> (Name, [Name])
 namesOfAvar gamma ix = namesOfArray (groupOfAvar gamma ix) (undefined::e)
@@ -83,6 +96,8 @@ groupOfAvar (Gamma gamma) = groupOfInt . (gamma Map.!) . Idx_
 groupOfInt :: Int -> Name
 groupOfInt n = "In" ++ show n
 
+namesOfSvar :: forall senv sh e. (Shape sh, Elt e) => Gamma senv -> Idx senv (Array sh e) -> (Name, [Name])
+namesOfSvar gamma ix = namesOfChunk (groupOfAvar gamma ix) (undefined::e)
 
 -- Types of compilation units
 -- --------------------------
@@ -90,20 +105,20 @@ groupOfInt n = "In" ++ show n
 -- A CUDA compilation unit, together with the name of the main __global__ entry
 -- function.
 --
-data CUTranslSkel aenv a = CUTranslSkel Name [C.Definition]
+data CUTranslSkel senv aenv a = CUTranslSkel Name [C.Definition]
 
-instance Show (CUTranslSkel aenv a) where
+instance Show (CUTranslSkel senv aenv a) where
   show (CUTranslSkel entry _) = entry
 
-instance Pretty (CUTranslSkel aenv a) where
+instance Pretty (CUTranslSkel senv aenv a) where
   ppr  (CUTranslSkel _ code)  = ppr code
 
 -- Scalar expressions, including the environment of local let-bindings to bring
 -- into scope before evaluating the body.
 --
-data CUExp aenv a where
+data CUExp senv aenv a where
   CUExp  :: ([C.BlockItem], [C.Exp])
-         -> CUExp aenv a
+         -> CUExp senv aenv a
 
 -- Scalar functions of particular arity, with local bindings.
 --
@@ -111,26 +126,27 @@ type Eliminate a        = forall x. [x] -> [(Bool,x)]
 type Instantiate1 a b   = forall x. Rvalue x => [x] -> ([C.BlockItem], [C.Exp])
 type Instantiate2 a b c = forall x y. (Rvalue x, Rvalue y) => [x] -> [y] -> ([C.BlockItem], [C.Exp])
 
-data CUFun1 aenv f where
+data CUFun1 senv aenv f where
   CUFun1 :: (Elt a, Elt b)
          => Eliminate a
          -> Instantiate1 a b
-         -> CUFun1 aenv (a -> b)
+         -> CUFun1 senv aenv (a -> b)
 
-data CUFun2 aenv f where
+
+data CUFun2 senv aenv f where
   CUFun2 :: (Elt a, Elt b, Elt c)
          => Eliminate a
          -> Eliminate b
          -> Instantiate2 a b c
-         -> CUFun2 aenv (a -> b -> c)
+         -> CUFun2 senv aenv (a -> b -> c)
 
 -- Delayed arrays
 --
-data CUDelayedAcc aenv sh e where
-  CUDelayed :: CUExp  aenv sh
-            -> CUFun1 aenv (sh -> e)
-            -> CUFun1 aenv (Int -> e)
-            -> CUDelayedAcc aenv sh e
+data CUDelayedAcc senv aenv sh e where
+  CUDelayed :: CUExp  senv aenv sh
+            -> CUFun1 senv aenv (sh -> e)
+            -> CUFun1 senv aenv (Int -> e)
+            -> CUDelayedAcc senv aenv sh e
 
 
 -- Common expression forms
@@ -212,6 +228,10 @@ cfromIndex shName ixName tmpName = fromIndex (map rvalue shName) (rvalue ixName)
         in
         ((ix':tmps, [cexp| $id:tmp / $exp:d |], n+1), [cexp| $id:tmp % $exp:d |])
 
+-- Element index in a chunk given the size of elements in the stream.
+-- OBS: Assumes output variable "ix" contains output array index.
+cchunkIndex :: C.Exp -> C.Exp
+cchunkIndex k = [cexp| $id:ix / $exp:k |] where ix = "ix"
 
 -- Thread blocks and indices
 -- -------------------------
@@ -255,17 +275,17 @@ indexArray dev elt arr ix
 -- linearly index this array. Note that dimensional indexing results in error.
 --
 readArray
-    :: forall aenv sh e. (Shape sh, Elt e)
+    :: forall senv aenv sh e. (Shape sh, Elt e)
     => Name                             -- group names
     -> Array sh e                       -- dummy to fix types
     -> ( [C.Param]
        , [C.Exp]
-       , CUDelayedAcc aenv sh e )
+       , CUDelayedAcc senv aenv sh e )
 readArray grp dummy
   = let (sh, arrs)      = namesOfArray grp (undefined :: e)
         args            = arrayAsArg dummy grp
 
-        dim             = expDim (undefined :: Exp aenv sh)
+        dim             = expDim (undefined :: Exp () aenv sh)
         sh'             = cshape dim sh
         get ix          = ([], map (\a -> [cexp| $id:a [ $exp:ix ] |]) arrs)
         manifest        = CUDelayed (CUExp ([], sh'))
@@ -289,7 +309,7 @@ writeArray
        , Rvalue x => x -> [C.Exp] )     -- write an element at a given index
 writeArray grp _ =
   let (sh, arrs)        = namesOfArray grp (undefined :: e)
-      dim               = expDim (undefined :: Exp aenv sh)
+      dim               = expDim (undefined :: Exp () aenv sh)
       sh'               = cshape' dim sh
       extent            = [ [cparam| const $ty:cint $id:i |] | i <- sh' ]
       adata             = zipWith (\t n -> [cparam| $ty:t * __restrict__ $id:n |]) (eltType (undefined :: e)) arrs
@@ -359,10 +379,44 @@ environment dev gamma@(Gamma aenv)
     asArg ix = arrayAsArg (undefined :: Array sh e) (groupOfAvar gamma ix)
 
 
+
+-- Array environment references. The method in which arrays are accessed depends
+-- on the device architecture (see below). We always include the array shape
+-- before the array data terms.
+--
+--   compute 1.x:
+--      texture references of type [Definition]
+--
+--   compute 2.x and 3.x:
+--      function arguments of type [Param]
+--
+-- NOTE: The environment variables must always be the first argument to the
+--       kernel function, as this is where they will be marshaled during the
+--       execution phase.
+--
+environmentS
+    :: forall senv. DeviceProperties
+    -> Gamma senv
+    -> ([C.Definition], [C.Param])
+environmentS dev gamma@(Gamma senv)
+  | computeCapability dev < Compute 2 0
+  = Map.foldrWithKey (\(Idx_ v) _ (ds,ps) -> let (d,p) = asTex v in (d++ds, p++ps)) ([],[]) senv -- TODO texures not supported by streaming yet.
+
+  | otherwise
+  = ([], Map.foldrWithKey (\(Idx_ v) _ vs -> asArg v ++ vs) [[cparam| const $ty:cint chunksz |] | Map.size senv > 0] senv)
+
+  where
+    asTex :: forall sh e. (Shape sh, Elt e) => Idx senv (Array sh e) -> ([C.Definition], [C.Param])
+    asTex ix = arrayAsTexS (undefined :: Array sh e) (groupOfAvar gamma ix)
+
+    asArg :: forall sh e. (Shape sh, Elt e) => Idx senv (Array sh e) -> [C.Param]
+    asArg ix = arrayAsArgS (undefined :: Array sh e) (groupOfAvar gamma ix)
+
+
 arrayAsTex :: forall sh e. (Shape sh, Elt e) => Array sh e -> Name -> ([C.Definition], [C.Param])
 arrayAsTex _ grp =
   let (sh, arrs)        = namesOfArray grp (undefined :: e)
-      dim               = expDim (undefined :: Exp aenv sh)
+      dim               = expDim (undefined :: Exp () aenv sh)
       extent            = [ [cparam| const $ty:cint $id:i |] | i <- cshape' dim sh ]
       adata             = zipWith (\t a -> [cedecl| static $ty:t $id:a; |]) (eltTypeTex (undefined :: e)) arrs
   in
@@ -371,7 +425,26 @@ arrayAsTex _ grp =
 arrayAsArg :: forall sh e. (Shape sh, Elt e) => Array sh e -> Name -> [C.Param]
 arrayAsArg _ grp =
   let (sh, arrs)        = namesOfArray grp (undefined :: e)
-      dim               = expDim (undefined :: Exp aenv sh)
+      dim               = expDim (undefined :: Exp () aenv sh)
+      extent            = [ [cparam| const $ty:cint $id:i |] | i <- cshape' dim sh ]
+      adata             = zipWith (\t n -> [cparam| const $ty:t * __restrict__ $id:n |]) (eltType (undefined :: e)) arrs
+  in
+  extent ++ adata
+
+
+arrayAsTexS :: forall sh e. (Shape sh, Elt e) => Array sh e -> Name -> ([C.Definition], [C.Param])
+arrayAsTexS _ grp =
+  let (sh, arrs)        = namesOfChunk grp (undefined :: e)
+      dim               = expDim (undefined :: Exp () aenv sh)
+      extent            = [ [cparam| const $ty:cint $id:i |] | i <- cshape' dim sh ]
+      adata             = zipWith (\t a -> [cedecl| static $ty:t $id:a; |]) (eltTypeTex (undefined :: e)) arrs
+  in
+  (adata, extent)
+
+arrayAsArgS :: forall sh e. (Shape sh, Elt e) => Array sh e -> Name -> [C.Param]
+arrayAsArgS _ grp =
+  let (sh, arrs)        = namesOfChunk grp (undefined :: e)
+      dim               = expDim (undefined :: Exp () aenv sh)
       extent            = [ [cparam| const $ty:cint $id:i |] | i <- cshape' dim sh ]
       adata             = zipWith (\t n -> [cparam| const $ty:t * __restrict__ $id:n |]) (eltType (undefined :: e)) arrs
   in
@@ -396,6 +469,22 @@ locals base _
                           in ( (t, name), cvar name, [cdecl| $ty:t $id:name; |] )
     in
     unzip3 $ zipWith local elt [n-1, n-2 .. 0]
+
+
+-- Declare some local variables for a shape given its dimension.
+--
+localsShapeFromDim ::
+               Name
+            -> Int                           -- dim
+            -> ( [(C.Type, Name)]            -- const declarations
+               , [C.Exp], [C.InitGroup])     -- mutable declaration and names
+localsShapeFromDim base n
+  = let elt             = replicate n cint
+        local t v       = let name = base ++ show v
+                          in ( (t, name), cvar name, [cdecl| $ty:t $id:name; |] )
+    in
+    unzip3 $ zipWith local elt [n-1, n-2 .. 0]
+
 
 class Lvalue a where
   lvalue :: a -> C.Exp -> C.BlockItem
